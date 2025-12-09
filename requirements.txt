@@ -1,0 +1,30 @@
+# --- 核心框架 ---
+fastapi>=0.115.0
+uvicorn[standard]
+python-multipart>=0.0.9
+
+# --- 数据库与迁移 ---
+tortoise-orm[aiomysql]
+aerich>=0.9.1
+# aiomysql 已经被 tortoise-orm 包含，但显式写出也没问题
+aiomysql
+
+# --- 缓存与 Redis ---
+# 建议去掉 [hiredis] 除非你在 Linux 且追求极致性能，否则在 Windows 上容易安装失败
+redis[hiredis]>=5.0.0
+fakeredis>=2.20.0
+lupa
+# --- 认证与安全 (重点修复部分) ---
+# 移除了 bcrypt==3.2.2 的锁定，使用 passlib 处理哈希更标准
+passlib[bcrypt]
+cryptography>=41.0.0
+pyjwt[crypto]
+# --- 工具库 ---
+pydantic-settings>=2.0.0
+# pydantic 会被 fastapi 和 settings 自动引入
+loguru
+PyYAML
+jinja2
+aiofiles
+httpx[h2]
+APScheduler
