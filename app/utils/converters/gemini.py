@@ -18,6 +18,7 @@ class GeminiConverter:
     - 支持 Function Calling 双向转换
     - 支持 多模态 (图片 URL 自动转 Base64)
     - 严格的错误处理和日志记录
+    - [新增] 支持通过模型后缀 (-maxthinking, -nothinking) 自动控制思考预算
     """
 
     # Gemini 安全设置：默认全部放开，防止因安全策略导致的拒答
@@ -39,6 +40,7 @@ class GeminiConverter:
         将 OpenAI 格式的请求字典转换为 Gemini API 格式
         """
         messages = request_dict.get("messages", [])
+        model_name = request_dict.get("model", "").lower()
         
         contents = []
         system_instructions = []
@@ -165,36 +167,50 @@ class GeminiConverter:
             stops = request_dict["stop"]
             generation_config["stopSequences"] = stops if isinstance(stops, list) else [stops]
 
-        # --- D. 处理 Thinking Config (适配 Cherry Studio / Extra Body) ---
-        extra_body = request_dict.get("extra_body", {})
-        thinking_conf = None
-        if extra_body and "google" in extra_body:
-            thinking_conf = extra_body["google"].get("thinking_config")
-            
-        # 只有显式传递了 thinking_config 才处理
-        if thinking_conf:
-            # 【修复】严格校验 Budget，防止出现 includeThoughts=True 但 Budget=0 导致的 400 错误
-            raw_budget = thinking_conf.get("thinking_budget")
-            budget = 1024 # 默认值
-            
-            # 尝试转换为整数
-            if raw_budget is not None:
-                try:
-                    budget = int(raw_budget)
-                except (ValueError, TypeError):
-                    budget = 1024
-            
-            include_thoughts = thinking_conf.get("include_thoughts", True)
+        # --- D. 处理 Thinking Config (核心修改) ---
+        # 优先级：模型后缀变体 > 用户传入的 extra_body > 默认无
+        
+        final_budget = None
+        final_include_thoughts = True
 
-            # 关键逻辑：如果 budget <= 0，说明 Thinking 被禁用。
-            # 此时必须将 includeThoughts 强制设为 False，否则 Gemini API 会报错：
-            # "Thinking_config.include_thoughts is only enabled when thinking is enabled"
-            if budget <= 0:
-                include_thoughts = False
+        if model_name.endswith("-maxthinking"):
+            # 变体 1: 满血思考 (Max Budget)
+            # Gemini 2.0 目前最大支持 64k tokens 左右的思考，这里设为 64000 安全值
+            if "flash" in model_name:
+                final_budget = 24576
+            else:
+                final_budget = 32768
+            final_include_thoughts = True
             
+        elif model_name.endswith("-nothinking"):
+            # 变体 2: 禁用思考
+            final_budget = 0
+            final_include_thoughts = False
+            
+        else:
+            # 变体 3: 原始模式 (用户自定义)
+            extra_body = request_dict.get("extra_body", {})
+            if extra_body and "google" in extra_body:
+                thinking_conf = extra_body["google"].get("thinking_config")
+                if thinking_conf:
+                    raw_budget = thinking_conf.get("thinking_budget")
+                    try:
+                        final_budget = int(raw_budget) if raw_budget is not None else 1024
+                    except (ValueError, TypeError):
+                        final_budget = 1024
+                    
+                    final_include_thoughts = thinking_conf.get("include_thoughts", True)
+
+        # 只有确定有 thinking 配置时才写入
+        if final_budget is not None:
+            # 安全检查：如果 Budget <= 0，强制关闭思考
+            if final_budget <= 0:
+                final_include_thoughts = False
+                final_budget = 0 # 规范化
+
             generation_config["thinkingConfig"] = {
-                "thinkingBudget": budget,
-                "includeThoughts": include_thoughts
+                "thinkingBudget": final_budget,
+                "includeThoughts": final_include_thoughts
             }
 
         payload = {

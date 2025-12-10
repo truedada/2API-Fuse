@@ -200,7 +200,155 @@ class GoogleAuthService:
             "credentials": credentials,
             "is_active": True,
             # 更新为参考代码中的较新模型, 且符合 GCLI 的调用习惯
-            "supported_models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3-pro-preview"] 
+            "supported_models": ["gemini-2.5-pro",
+        "gemini-2.5-pro-maxthinking",
+        "gemini-2.5-pro-nothinking",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-maxthinking",
+        "gemini-2.5-flash-nothinking",
+        "gemini-3-pro-preview",
+        "gemini-3-pro-preview-maxthinking",
+        "gemini-3-pro-preview-nothinking"] ,
+            "rate_limits": {
+  "gemini-2.5-flash": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-2.5-flash-maxthinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-2.5-flash-nothinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-2.5-pro": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-2.5-pro-maxthinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-2.5-pro-nothinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-3-pro-preview": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-3-pro-preview-maxthinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ],
+  "gemini-3-pro-preview-nothinking": [
+    {
+      "period": 60,
+      "count": 5,
+      "group": "all_1m_limit"
+    },
+    {
+      "period": 86400,
+      "count": 100,
+      "group": "pro_1d_limit"
+    },
+    {
+      "period": 86400,
+      "count": 1500,
+      "group": "all_1d_limit"
+    }
+  ]
+}
         }
         
         channel = await self.channel_repo.create(**new_channel_data)

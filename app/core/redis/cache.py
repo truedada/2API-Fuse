@@ -40,9 +40,13 @@ class CacheKeys:
         return f"{PREFIX}platform:{p_id}"
 
     @staticmethod
-    def channel_usage(c_id: int, model: str, period: int) -> str:
-        # 字符串结构 (String/Int)，存储某渠道在特定周期内的已用次数
-        return f"{PREFIX}usage:ch:{c_id}:m:{model}:p:{period}"
+    def channel_usage(c_id: int, bucket_name: str, period: int) -> str:
+        """
+        字符串结构 (String/Int)，存储某渠道在特定周期内的已用次数。
+        【修改】第二个参数由 model 改为 bucket_name。
+        如果配置了 group，这里传入 group 名；否则传入 model 名。
+        """
+        return f"{PREFIX}usage:ch:{c_id}:b:{bucket_name}:p:{period}"
     
     @staticmethod
     def channel_error_count(c_id: int) -> str:
@@ -85,19 +89,23 @@ class CacheService:
     async def sync_platform(platform_id: int):
         """
         将平台配置同步到 Redis，实现热更新。
+        并联动刷新该平台下所有 Channel 的缓存，确保数据一致性。
         """
         platform = await Platform.get_or_none(id=platform_id)
         client = await get_redis_client()
         key = CacheKeys.platform_config(platform_id)
 
-        # 【关键】配置变更，删除预构建的模型 JSON，迫使下次读取时重新生成
+        # 1. 删除系统级模型列表缓存（触发重构）
         await client.delete(CacheKeys.sys_models_json())
 
+        # 2. 如果平台不存在（被删除），清除平台缓存
         if not platform:
             await client.delete(key)
+            # 注意：如果数据库设置了级联删除，Channel 可能也已经没了。
+            # 这里可以尝试清理残留 Channel 缓存，但通常由 remove_channel 处理。
             return
 
-        # 提取需要频繁读取的字段
+        # 3. 更新平台自身的缓存
         cache_data = {
             "id": platform.id,
             "adapter_type": platform.adapter_type,
@@ -111,6 +119,20 @@ class CacheService:
         # 存入 JSON，设置较长过期时间 (如 7 天)
         await client.set(key, json.dumps(cache_data), ex=86400 * 7)
         logger.info(f"同步了平台 {platform_id} 到 Redis")
+
+        # ----------------------------------------------------------
+        # 【修复核心】联动更新：刷新所有属于该平台的 Channel 缓存
+        # ----------------------------------------------------------
+        # 因为 Channel 缓存中冗余存储了 Platform 的 base_url 等信息，
+        # Platform 变了，Channel 的缓存也必须跟着变。
+        channels = await Channel.filter(platform_id=platform_id).all()
+        
+        if channels:
+            logger.info(f"平台 {platform_id} 配置变更，正在联动刷新 {len(channels)} 个 Channel 的缓存...")
+            # 使用 asyncio.gather 并发执行，避免循环 await 导致阻塞太久
+            sync_tasks = [CacheService.sync_channel(c.id) for c in channels]
+            await asyncio.gather(*sync_tasks)
+            logger.info(f"平台 {platform_id} 下的所有 Channel 缓存刷新完毕")
 
     @staticmethod
     async def get_platform_config(platform_id: int) -> Dict[str, Any]:
@@ -246,7 +268,7 @@ class CacheService:
 
     @staticmethod
     async def record_channel_usage(channel_id: int, model_name: str):
-        ### 核心限流逻辑 ###
+        ### 核心限流逻辑 (支持分组限流) ###
         client = await get_redis_client()
         info_json = await client.get(CacheKeys.channel_info(channel_id))
         if not info_json: 
@@ -254,6 +276,7 @@ class CacheService:
         info = json.loads(info_json)
         
         limits_map = info.get('rate_limits', {})
+        # 获取当前模型的所有规则
         rules = limits_map.get(model_name) or limits_map.get('default')
             
         if not rules: 
@@ -266,14 +289,19 @@ class CacheService:
         for rule in rules:
             p = rule.get('period')
             c = rule.get('count')
+            # 【核心修改】检查是否存在 'group' 字段
+            # 如果存在 group，则使用 group 作为 bucket_name，否则使用 model_name
+            bucket_name = rule.get('group') or model_name
+
             if p and c:
-                usage_keys.append(CacheKeys.channel_usage(channel_id, model_name, p))
+                usage_keys.append(CacheKeys.channel_usage(channel_id, bucket_name, p))
                 limits.append(c)
 
         if not usage_keys:
             return
 
         # Lua 脚本：原子性多周期检查
+        # 脚本逻辑不变，变的只是传入的 key 名称
         script = """
         local pool_key = KEYS[1]
         local channel_id = ARGV[1]
@@ -302,8 +330,12 @@ class CacheService:
         try:
             is_banned = await client.eval(script, len(script_keys), *script_keys, *script_args)
             if is_banned:
-                logger.warning(f"渠道 {channel_id} 的 {model_name} 达到了使用限制")
+                logger.warning(f"渠道 {channel_id} 的 {model_name} (或其分组) 达到了使用限制")
             
+            # 记录用于 Scheduler 异步持久化的消息
+            # 注意：这里我们只记录 model_name，Scheduler 需要自行聚合处理数据库的 usage_progress
+            # 或者，如果 Scheduler 也升级了逻辑，可以传递 group 信息。
+            # 为了兼容性，这里暂时只传 model_name，依赖 Scheduler 拉取 Redis 真实计数或根据配置反推。
             msg = f"{channel_id}|{model_name}|{int(time.time())}"
             await client.rpush(CacheKeys.sync_queue_channel(), msg)
             
@@ -366,7 +398,7 @@ class CacheService:
             "platform_id": p.id, 
             "adapter": p.adapter_type,
             "base_url": p.base_url,
-            "proxy": p.proxy_url,
+            "proxy_url": p.proxy_url, 
             "credentials": channel.credentials,
             "model_map": p.model_map, 
             "rate_limits": channel.rate_limits,
@@ -387,12 +419,22 @@ class CacheService:
                 for rule in rules:
                     p_val = str(rule['period'])
                     limit = rule['count']
-                    used = usage_prog.get(model, {}).get(p_val, {}).get("count", 0)
+                    
+                    # 【核心修改】同步逻辑也要支持 group
+                    # 如果配置了 group，进度应该去 group 下面找
+                    # 注意：Scheduler 写入 usage_progress 时也需要遵循此逻辑（Key 为 group 名或 model 名）
+                    bucket_name = rule.get('group') or model
+                    
+                    # 从 usage_progress 获取已用量 (假设 DB 中也按照 bucket_name 存储了)
+                    # 如果 DB 还是按 model 存，这里逻辑需要适配。
+                    # 建议：DB 的 usage_progress 第一层 Key 统一改为 bucket_name
+                    used = usage_prog.get(bucket_name, {}).get(p_val, {}).get("count", 0)
                     
                     if used >= limit:
                         is_banned = True
                     
-                    pipeline.set(CacheKeys.channel_usage(channel.id, model, int(p_val)), used)
+                    # 恢复 Redis 计数器
+                    pipeline.set(CacheKeys.channel_usage(channel.id, bucket_name, int(p_val)), used)
 
                 if not is_banned:
                     pipeline.sadd(CacheKeys.available_pool(model), channel.id)

@@ -36,7 +36,17 @@ async def seed_data():
             "name": "GeminiCli",
             "adapter_type": "geminicli",
             "base_url": "https://cloudcode-pa.googleapis.com/v1internal",
-            "default_models" : ["gemini-2.5-pro","gemini-2.5-flash","gemini-3-pro-preview"]
+            "default_models": [
+            "gemini-2.5-pro",
+            "gemini-2.5-pro-maxthinking",
+            "gemini-2.5-pro-nothinking",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-maxthinking",
+            "gemini-2.5-flash-nothinking",
+            "gemini-3-pro-preview",
+            "gemini-3-pro-preview-maxthinking",
+            "gemini-3-pro-preview-nothinking"
+    ]
         }
     ]
 

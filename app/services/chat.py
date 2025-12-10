@@ -169,18 +169,26 @@ class ChatService:
         # 5.A 流式处理 (Streaming)
         # -----------------------------------------------------------
         if request.stream:
-            # ### 关键 ###
-            # 记录渠道使用次数 (Fire-and-forget via BackgroundTasks)
-            # 这里是为了让 Redis 计数器尽快增加，防止瞬间并发穿透
-            background_tasks.add_task(CacheService.record_channel_usage, channel_id, user_model_name)
+            # [修改说明] 移除了此处原本的 background_tasks.add_task(CacheService.record_channel_usage...)
+            # 改为在 stream_wrapper 内部，确认请求成功发出（收到第一个 chunk）时再记录。
+            # 避免因 Adapter 初始化失败（如 Get Token 失败）而错误地增加调用计数。
 
             async def stream_wrapper(generator):
                 total_tokens_accumulated = 0
                 estimated_tokens = 0
                 has_error = False # 标记本次请求是否出错
+                usage_recorded = False # [修改] 标记是否已记录渠道使用
                 
                 try:
                     async for chunk in generator:
+                        
+                        # [修改] 延迟记录逻辑：收到第一个 chunk 意味着请求已成功发送并建立了连接
+                        # 此时记录使用量是安全的，符合"发送到服务器才算调用"的逻辑
+                        if not usage_recorded:
+                            usage_recorded = True
+                            # 使用 asyncio.create_task 异步记录，不阻塞流
+                            asyncio.create_task(CacheService.record_channel_usage(channel_id, user_model_name))
+
                         yield chunk
                         
                         # ### 尝试从 chunk 中解析 Token 信息 ###

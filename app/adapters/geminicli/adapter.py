@@ -53,6 +53,12 @@ class GeminiCliAdapter(BaseAdapter):
         
         # 凭证解析
         self.cred_type = self._determine_credential_type()
+         # 打印调试信息，确认代理配置是否生效
+        if self.proxy_url:
+            
+            logger.debug(f"[GeminiCli] 初始化完成，已配置代理: {self.proxy_url}")
+        else:
+            logger.debug("[GeminiCli] 初始化完成，未配置代理。")
         
     def _determine_credential_type(self) -> str:
         """
@@ -170,6 +176,10 @@ class GeminiCliAdapter(BaseAdapter):
         full_model = model
         if full_model.startswith("models/"):
             full_model = full_model.replace("models/", "")
+            
+        # [新增] 剥离自定义后缀 (-maxthinking, -nothinking)
+        # 确保发送给 Google 内部接口的是干净的原始模型名
+        full_model = full_model.replace("-maxthinking", "").replace("-nothinking", "")
 
         return {
             "model": full_model,
@@ -182,10 +192,10 @@ class GeminiCliAdapter(BaseAdapter):
         model = request_data.get("model")
         token = await self._get_access_token()
         
-        # 1. 使用 Converter 转换基础请求
+        # 1. 使用 Converter 转换基础请求 (包含 Thinking Config 处理)
         gemini_payload = await GeminiConverter.openai_to_gemini_payload(request_data)
         
-        # 2. 封装为 GCLI 格式
+        # 2. 封装为 GCLI 格式 (这里会剥离后缀)
         final_payload = self._wrap_internal_payload(model, gemini_payload)
         
         # 3. 准备 URL 和 Headers
@@ -226,12 +236,12 @@ class GeminiCliAdapter(BaseAdapter):
         model = request_data.get("model")
         token = await self._get_access_token()
         
-        # 1. 使用 Converter 转换基础请求
+        # 1. 使用 Converter 转换基础请求 (包含 Thinking Config 处理)
         gemini_payload = await GeminiConverter.openai_to_gemini_payload(request_data)
         
-        # 2. 封装为 GCLI 格式
+        # 2. 封装为 GCLI 格式 (这里会剥离后缀)
         final_payload = self._wrap_internal_payload(model, gemini_payload)
-        
+        #logger.debug(f"Gemini 流式请求头 {final_payload}")
         # 3. 准备 URL
         url = self._get_api_url("streamGenerateContent", stream=True) + "?alt=sse"
         
@@ -282,6 +292,7 @@ class GeminiCliAdapter(BaseAdapter):
                             raw_chunk = json.loads(chunk_str)
                             # 5.2 解包 response 字段 (Internal API 特性)
                             # 原始数据可能是: { "response": { "candidates": ... } }
+                            # logger.debug(raw_chunk)
                             actual_chunk = raw_chunk.get("response", raw_chunk)
                             
                             # 5.3 重新构造成 SSE 行字符串，供 Converter 解析
@@ -360,11 +371,18 @@ class GeminiCliAdapter(BaseAdapter):
     async def fetch_models(self) -> List[str]:
         """
         获取可用模型列表
-        Internal API 不提供标准的模型列表接口，尝试访问但预期会失败。
+        [修改] 动态生成变体列表，方便前端自动发现
         """
         BASE_MODELS = [
             "gemini-2.5-pro",
             "gemini-2.5-flash",
             "gemini-3-pro-preview",
         ]
-        return BASE_MODELS
+        
+        final_list = []
+        for base in BASE_MODELS:
+            final_list.append(base) # 原始
+            final_list.append(f"{base}-maxthinking") # 满血思考
+            final_list.append(f"{base}-nothinking") # 禁用思考
+            
+        return final_list

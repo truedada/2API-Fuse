@@ -185,8 +185,7 @@ class SchedulerService:
     async def _update_single_channel(self, c_id: int, model_increments: Dict[str, int]):
         """
         辅助函数：处理单个 Channel 的 DB 更新
-        【核心修复】：在此处不仅更新使用次数，还需重新计算 next_reset_time，
-        确保数据库索引字段与 JSON 内部状态一致。
+        【修改】支持 Group 限流，写入 usage_progress 时使用 Bucket Name (Group or Model)
         """
         try:
             channel = await Channel.get_or_none(id=c_id)
@@ -202,60 +201,60 @@ class SchedulerService:
                 rules = limits_map.get(model) or limits_map.get('default', [])
                 if not rules: continue
                 
-                if model not in current_progress:
-                    current_progress[model] = {}
-                
                 for rule in rules:
                     p = str(rule['period']) 
+                    # 【核心修改】确定 Bucket Key (优先使用 Group)
+                    bucket_name = rule.get('group') or model
+
+                    if bucket_name not in current_progress:
+                        current_progress[bucket_name] = {}
                     
-                    if p not in current_progress[model]:
+                    if p not in current_progress[bucket_name]:
                         # 初始化：如果第一次用到，last_reset 设为当前时间
-                        current_progress[model][p] = {
+                        current_progress[bucket_name][p] = {
                             "count": 0, 
                             "last_reset": now 
                         }
                     
-                    current_progress[model][p]["count"] += inc_val
+                    current_progress[bucket_name][p]["count"] += inc_val
                     updated_flag = True
             
             if updated_flag:
-                # 2. 【新增】计算全局最小的 next_reset_time
-                # 必须遍历所有模型和所有规则，找到该渠道所有限制中最早会过期的那个时间点
+                # 2. 计算全局最小的 next_reset_time
+                # 只有当 count > 0 的桶才需要参与下一次重置的计算
                 min_next_reset = float('inf')
                 
-                # 遍历渠道支持的所有模型（因为不仅要看本次更新的，还要看之前可能存在的）
-                # 这里简单起见，遍历 limits_map 定义的规则即可
                 for model_key, rules in limits_map.items():
-                    model_prog = current_progress.get(model_key, {})
-                    
+                    # 注意：这里需要根据规则找到对应的 bucket
                     for rule in rules:
                         period = int(rule['period'])
-                        # 获取该规则对应的当前状态
-                        bucket = model_prog.get(str(period))
+                        bucket_name = rule.get('group') or model_key
                         
-                        if bucket:
+                        bucket = current_progress.get(bucket_name, {}).get(str(period))
+                        
+                        if bucket and bucket.get("count", 0) > 0:
+                            # 只有在这个周期内用过的，才需要计算过期时间
                             last_reset = bucket.get('last_reset', now)
                             next_due = last_reset + period
                             if next_due < min_next_reset:
                                 min_next_reset = next_due
-                        else:
-                            # 如果从未用过，潜在的重置时间是 now + period (假设现在开始用)
-                            # 或者忽略它，只关注已使用的。这里为了严谨，只关注已使用的桶。
-                            pass
 
                 # 3. 准备更新字段
                 update_fields = ["usage_progress"]
                 channel.usage_progress = current_progress
                 
-                # 如果计算出了有效的下次重置时间，且与当前DB不一致，则更新索引列
+                # 如果计算出了有效的下次重置时间，则更新索引列
                 if min_next_reset != float('inf'):
-                    # 确保 next_reset_time 始终指向未来，或者当前（如果是待重置状态）
+                    # 正常情况，指向未来
                     if channel.next_reset_time != int(min_next_reset):
                         channel.next_reset_time = int(min_next_reset)
                         update_fields.append("next_reset_time")
-                elif channel.next_reset_time == 0 and updated_flag:
-                     # 兜底：如果是第一次使用且没算出 min（逻辑上不应该），给个值防止死锁
-                     pass 
+                else:
+                    # 如果所有桶都是空的（虽然这里是update一定是加了数，但逻辑上闭环），
+                    # 或者刚重置完还没用（不应该进入这里），设为0避免空跑
+                    if channel.next_reset_time != 0:
+                        channel.next_reset_time = 0
+                        update_fields.append("next_reset_time")
 
                 await channel.save(update_fields=update_fields)
                 
@@ -307,13 +306,15 @@ class SchedulerService:
 
     async def _reset_expired_quotas(self):
         """
-        重置任务：查询 next_reset_time <= now 的渠道，进行重置并恢复 Redis
+        重置任务：查询 next_reset_time <= now 的渠道
+        【优化策略】：如果渠道在过期周期内没有使用（count=0），则不执行重置动作，
+        并将其 next_reset_time 设为 0，停止调度，直到下一次有真实调用触发更新。
+        【修改】支持 Group 限流，清理 Redis Key 时使用 Bucket Name
         """
         try:
             now = int(time.time())
             
-            # ### 查找需要处理的渠道 ###
-            # 利用索引字段 next_reset_time，只取出那些“已经到了重置时间”的账号
+            # 查找需要处理的渠道
             channels = await Channel.filter(
                 is_active=True, 
                 next_reset_time__lte=now, 
@@ -326,6 +327,7 @@ class SchedulerService:
             client = await get_redis_client()
             pipeline = client.pipeline()
             has_redis_ops = False
+            reset_count = 0
             
             for ch in channels:
                 progress = ch.usage_progress or {}
@@ -333,69 +335,84 @@ class SchedulerService:
                 
                 min_next_reset = float('inf')
                 db_dirty = False
+                channel_was_reset = False # 标记该渠道本次是否发生了实际的额度恢复
                 
                 for model in ch.supported_models:
                     rules = limits_map.get(model) or limits_map.get('default', [])
                     if not rules: continue
                     
-                    model_prog = progress.get(model, {})
-                    
                     for rule in rules:
+                        # 【核心修改】确定 Bucket Key
+                        bucket_name = rule.get('group') or model
+                        
                         period = str(rule['period'])
-                        bucket = model_prog.get(period, {"count": 0, "last_reset": 0})
+                        
+                        # 获取对应的进度 bucket (注意：这里是从 progress[bucket_name] 获取)
+                        bucket_prog = progress.get(bucket_name, {})
+                        bucket = bucket_prog.get(period, {"count": 0, "last_reset": 0})
+                        
                         last_reset = bucket.get('last_reset', 0)
+                        count = bucket.get('count', 0)
                         
-                        # 检查是否到期 (当前时间 - 上次重置时间 >= 周期)
+                        # 检查是否到期
                         if now - last_reset >= int(period):
-                            # --- 触发重置 ---
-                            bucket['count'] = 0
-                            bucket['last_reset'] = now
-                            db_dirty = True
-                            
-                            # ### 关键：清理 Redis 计数器 Key ###
-                            # 删掉它，计数器就归零了
-                            usage_key = CacheKeys.channel_usage(ch.id, model, int(period))
-                            pipeline.delete(usage_key)
-                            
-                            # ### 关键：复活策略 ###
-                            # 将 ID 放回 Available Pool，这样路由就能选到它了
-                            pipeline.sadd(CacheKeys.available_pool(model), ch.id)
-                            has_redis_ops = True
-                            
-                            next_due = now + int(period)
+                            # 只有当 count > 0 时，才执行“重置”动作
+                            if count > 0:
+                                bucket['count'] = 0
+                                bucket['last_reset'] = now
+                                db_dirty = True
+                                channel_was_reset = True
+                                
+                                # 【核心修改】清理 Redis 计数器，使用 bucket_name
+                                usage_key = CacheKeys.channel_usage(ch.id, bucket_name, int(period))
+                                pipeline.delete(usage_key)
+                                
+                                # 复活策略
+                                pipeline.sadd(CacheKeys.available_pool(model), ch.id)
+                                has_redis_ops = True
+                                
+                                # 重置后，新的下次到期时间是 now + period
+                                next_due = now + int(period)
+                            else:
+                                # Count 为 0，不更新 last_reset。
+                                next_due = float('inf') 
                         else:
-                            # 未到期，计算下次到期时间
-                            next_due = last_reset + int(period)
+                            # 未到期
+                            if count > 0:
+                                next_due = last_reset + int(period)
+                            else:
+                                next_due = float('inf')
                         
+                        # 维护全局最小重置时间
                         if next_due < min_next_reset:
                             min_next_reset = next_due
                             
-                        model_prog[period] = bucket
-                    
-                    progress[model] = model_prog
+                        # 写回内存结构
+                        bucket_prog[period] = bucket
+                        progress[bucket_name] = bucket_prog
 
-                # 保存 DB
+                # 保存逻辑
                 updates = {}
                 if db_dirty:
                     updates['usage_progress'] = progress
                 
-                # 更新索引字段，以便下次 Scheduler 能准确找到它
+                # 计算新的 DB 索引字段 next_reset_time
                 new_next = min_next_reset if min_next_reset != float('inf') else 0
                 
-                # 【修正逻辑】：如果计算出的时间比当前还小（异常情况），强制设为未来一点点，避免死循环
-                if new_next > 0 and new_next <= now:
-                     # 这种情况通常不应该发生，除非有极短周期的规则，这里做防御性处理
-                     pass
-
                 if new_next != ch.next_reset_time:
                     updates['next_reset_time'] = new_next
+                    db_dirty = True 
                 
-                if updates:
+                if db_dirty:
                     await Channel.filter(id=ch.id).update(**updates)
+                    if channel_was_reset:
+                        reset_count += 1
             
             if has_redis_ops:
                 await pipeline.execute()
-                logger.info(f"重置了 {len(channels)} 个渠道的额度")
+                
+            if reset_count > 0:
+                logger.info(f"重置了 {reset_count} 个渠道的额度 (跳过空闲渠道 {len(channels) - reset_count} 个)")
 
         except Exception as e:
             logger.error(f"执行 _reset_expired_quotas 时出错: {e}")
