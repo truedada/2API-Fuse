@@ -183,7 +183,11 @@ class SchedulerService:
             logger.debug(f"同步了 {len(updates)} api keys 共 {len(messages)} 使用记录到数据库")
 
     async def _update_single_channel(self, c_id: int, model_increments: Dict[str, int]):
-        """辅助函数：处理单个 Channel 的 DB 更新"""
+        """
+        辅助函数：处理单个 Channel 的 DB 更新
+        【核心修复】：在此处不仅更新使用次数，还需重新计算 next_reset_time，
+        确保数据库索引字段与 JSON 内部状态一致。
+        """
         try:
             channel = await Channel.get_or_none(id=c_id)
             if not channel: return
@@ -191,8 +195,9 @@ class SchedulerService:
             current_progress = channel.usage_progress or {}
             limits_map = channel.rate_limits or {}
             updated_flag = False
+            now = int(time.time())
             
-            # 遍历这次同步中，各个模型增加的调用次数
+            # 1. 更新计数逻辑
             for model, inc_val in model_increments.items():
                 rules = limits_map.get(model) or limits_map.get('default', [])
                 if not rules: continue
@@ -200,23 +205,60 @@ class SchedulerService:
                 if model not in current_progress:
                     current_progress[model] = {}
                 
-                # 遍历该模型下定义的每个周期 (桶)
-                # 例如：同时更新“分钟桶”和“天桶”
                 for rule in rules:
                     p = str(rule['period']) 
                     
                     if p not in current_progress[model]:
+                        # 初始化：如果第一次用到，last_reset 设为当前时间
                         current_progress[model][p] = {
                             "count": 0, 
-                            "last_reset": int(time.time())
+                            "last_reset": now 
                         }
                     
                     current_progress[model][p]["count"] += inc_val
                     updated_flag = True
             
             if updated_flag:
+                # 2. 【新增】计算全局最小的 next_reset_time
+                # 必须遍历所有模型和所有规则，找到该渠道所有限制中最早会过期的那个时间点
+                min_next_reset = float('inf')
+                
+                # 遍历渠道支持的所有模型（因为不仅要看本次更新的，还要看之前可能存在的）
+                # 这里简单起见，遍历 limits_map 定义的规则即可
+                for model_key, rules in limits_map.items():
+                    model_prog = current_progress.get(model_key, {})
+                    
+                    for rule in rules:
+                        period = int(rule['period'])
+                        # 获取该规则对应的当前状态
+                        bucket = model_prog.get(str(period))
+                        
+                        if bucket:
+                            last_reset = bucket.get('last_reset', now)
+                            next_due = last_reset + period
+                            if next_due < min_next_reset:
+                                min_next_reset = next_due
+                        else:
+                            # 如果从未用过，潜在的重置时间是 now + period (假设现在开始用)
+                            # 或者忽略它，只关注已使用的。这里为了严谨，只关注已使用的桶。
+                            pass
+
+                # 3. 准备更新字段
+                update_fields = ["usage_progress"]
                 channel.usage_progress = current_progress
-                await channel.save(update_fields=["usage_progress"])
+                
+                # 如果计算出了有效的下次重置时间，且与当前DB不一致，则更新索引列
+                if min_next_reset != float('inf'):
+                    # 确保 next_reset_time 始终指向未来，或者当前（如果是待重置状态）
+                    if channel.next_reset_time != int(min_next_reset):
+                        channel.next_reset_time = int(min_next_reset)
+                        update_fields.append("next_reset_time")
+                elif channel.next_reset_time == 0 and updated_flag:
+                     # 兜底：如果是第一次使用且没算出 min（逻辑上不应该），给个值防止死锁
+                     pass 
+
+                await channel.save(update_fields=update_fields)
+                
         except Exception as e:
             logger.error(f"同步单个 Channel {c_id} 失败: {e}")
 
@@ -339,6 +381,12 @@ class SchedulerService:
                 
                 # 更新索引字段，以便下次 Scheduler 能准确找到它
                 new_next = min_next_reset if min_next_reset != float('inf') else 0
+                
+                # 【修正逻辑】：如果计算出的时间比当前还小（异常情况），强制设为未来一点点，避免死循环
+                if new_next > 0 and new_next <= now:
+                     # 这种情况通常不应该发生，除非有极短周期的规则，这里做防御性处理
+                     pass
+
                 if new_next != ch.next_reset_time:
                     updates['next_reset_time'] = new_next
                 

@@ -58,7 +58,7 @@ class ChatService:
         获取系统支持的所有模型，并包装为 OpenAI 格式
         """
         # 从 Cache Service 获取聚合后的模型名称列表
-        models = await CacheService.get_all_system_models_fast
+        models = await CacheService.get_all_system_models()
         
         # 转换为 ModelCard 对象
         card_list = [

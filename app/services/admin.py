@@ -302,12 +302,26 @@ class AdminService:
     async def update_apikey(self, data: ApiKeyUpdate):
         update_dict = data.model_dump(exclude_unset=True, exclude={"id"})
         updated_key = await self.apikey_repo.update(data.id, update_dict)
+        
         if not updated_key:
             raise NotFound(detail="API Key 不存在")
+            
+        # 【新增】关键修复：强制移除缓存
+        # 无论是禁用 (is_active=False) 还是修改余额，都删除缓存
+        # 这样下次用户请求时会 Cache Miss -> 回源数据库 -> 触发 is_active 检查或同步新余额
+        await CacheService.remove_apikey(updated_key.key)
+        
         return updated_key
 
     async def delete_apikey(self, data: IDRequest):
-        count = await self.apikey_repo.delete(data.id)
-        if not count:
+        # 【新增】关键修复：先获取 Key 字符串用于清理缓存，再删除
+        target = await self.apikey_repo.get_by_id(data.id)
+        if not target:
             raise NotFound(detail="API Key 不存在")
+            
+        # 移除缓存
+        await CacheService.remove_apikey(target.key)
+        
+        # 数据库物理删除
+        await self.apikey_repo.delete(data.id)
         return True

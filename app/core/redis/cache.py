@@ -110,7 +110,7 @@ class CacheService:
         
         # 存入 JSON，设置较长过期时间 (如 7 天)
         await client.set(key, json.dumps(cache_data), ex=86400 * 7)
-        logger.info(f"Synced Platform {platform_id} to Redis")
+        logger.info(f"同步了平台 {platform_id} 到 Redis")
 
     @staticmethod
     async def get_platform_config(platform_id: int) -> Dict[str, Any]:
@@ -154,6 +154,17 @@ class CacheService:
         await client.hset(CacheKeys.apikey(key_obj.key), mapping=mapping)
         # 缓存 3 天，不活跃的 Key 自动从 Redis 消失
         await client.expire(CacheKeys.apikey(key_obj.key), 86400 * 3)
+
+    @staticmethod
+    async def remove_apikey(api_key: str):
+        """
+        【新增】强制移除 API Key 缓存
+        场景：管理员在后台禁用 Key 或修改额度时调用，迫使下次请求回源数据库
+        """
+        client = await get_redis_client()
+        key = CacheKeys.apikey(api_key)
+        await client.delete(key)
+        logger.debug(f"已清除 API Key 缓存: {api_key[:8]}...")
 
     @staticmethod
     async def atomic_deduct_quota(api_key: str, cost: int = 1) -> bool:

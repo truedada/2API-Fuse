@@ -14,9 +14,10 @@ from typing import Optional
 # 确保 logger 和 definitions 已被加载/配置
 from loguru import logger
 from app.core.exceptions.definitions import (
-    BaseAPIException, NotFound, ResourceConflict, DatabaseError
+    BaseAPIException, NotFound, ResourceConflict, DatabaseError, InvalidInput
 )
 from app.core.config import settings
+
 # --- 统一响应格式 ---
 def create_error_response(
     status_code: int,
@@ -112,8 +113,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
      details = []
      # 简化错误信息
      for error in errors:
-          loc = ".".join(map(str, error['loc']))
-          details.append(f"{loc}: {error['msg']} ({error['type']})")
+         loc = ".".join(map(str, error['loc']))
+         details.append(f"{loc}: {error['msg']} ({error['type']})")
 
      detail_str = "; ".join(details)
      logger.warning(f"请求参数验证失败: {detail_str} | Path: {request.url.path}")
@@ -147,6 +148,16 @@ async def tortoise_db_error_handler(request: Request, exc: OperationalError | DB
       # 转换为自定义的 500 异常
       return await api_exception_handler(request, DatabaseError(detail="数据库操作失败或连接不可用"))
 
+async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    """
+    处理 Python 内置 ValueError。
+    通常用于捕获业务逻辑中显式抛出的 raise ValueError("..."), 如 "未知的适配器"。
+    将其转换为 InvalidInput (400) 异常响应。
+    """
+    logger.warning(f"非法输入或参数错误: {exc} | Path: {request.url.path}")
+    # 转换为自定义的 InvalidInput 异常 (通常对应 HTTP 400)
+    return await api_exception_handler(request, InvalidInput(detail=str(exc)))
+
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
      """
      捕获所有未处理的异常 (500 Internal Server Error)。
@@ -178,15 +189,19 @@ def register_exception_handlers(app: FastAPI):
     app.add_exception_handler(BaseAPIException, api_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(ValidationError, validation_exception_handler) # celery task 可能抛出
+    
     # Tortoise ORM 异常
     app.add_exception_handler(DoesNotExist, tortoise_does_not_exist_handler)
     app.add_exception_handler(IntegrityError, tortoise_integrity_error_handler)
     app.add_exception_handler(OperationalError, tortoise_db_error_handler)
     app.add_exception_handler(DBConnectionError, tortoise_db_error_handler)
-     # FastAPI / Starlette HTTP 异常
+    
+    # FastAPI / Starlette HTTP 异常
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-    # 验证码错误
+    
+    # Python 内置异常 (业务逻辑校验)
+    app.add_exception_handler(ValueError, value_error_handler)
     
     # 兜底：所有其他 Exception
     app.add_exception_handler(Exception, generic_exception_handler)

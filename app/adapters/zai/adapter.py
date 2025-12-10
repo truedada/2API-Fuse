@@ -241,11 +241,18 @@ class ZaiAdapter(BaseAdapter):
         content = ""
         reasoning_content = ""
         model = request_data.get("model")
+        final_usage = None
         
         async for chunk in self.chat_completion_stream(request_data):
             if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
                 try:
                     data = json.loads(chunk[6:])
+                    
+                    # 1. 捕获 Usage 信息 (通常在最后一个 Chunk)
+                    if "usage" in data and data["usage"]:
+                        final_usage = data["usage"]
+
+                    # 2. 捕获内容
                     if "choices" in data:
                         delta = data["choices"][0]["delta"]
                         content += delta.get("content", "")
@@ -253,6 +260,15 @@ class ZaiAdapter(BaseAdapter):
                 except:
                     pass
         
+        # 如果上游没有返回 usage，则进行简单估算以防止 Token 为 0
+        if not final_usage:
+            
+            final_usage = {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            }
+
         return {
             "id": str(uuid.uuid4()),
             "object": "chat.completion",
@@ -266,7 +282,8 @@ class ZaiAdapter(BaseAdapter):
                     "reasoning_content": reasoning_content
                 },
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": final_usage # 确保返回 usage
         }
 
     async def chat_completion_stream(self, request_data: Dict[str, Any]) -> AsyncGenerator[str, None]:

@@ -167,16 +167,35 @@ class GeminiConverter:
 
         # --- D. 处理 Thinking Config (适配 Cherry Studio / Extra Body) ---
         extra_body = request_dict.get("extra_body", {})
-        if extra_body:
-            google_conf = extra_body.get("google", {})
-            thinking_conf = google_conf.get("thinking_config")
+        thinking_conf = None
+        if extra_body and "google" in extra_body:
+            thinking_conf = extra_body["google"].get("thinking_config")
             
-            # 只有显式传递了 thinking_config 或者是 gemini-2.0-flash-thinking 模型才添加
-            if thinking_conf:
-                generation_config["thinkingConfig"] = {
-                    "thinkingBudget": thinking_conf.get("thinking_budget", 1024),
-                    "includeThoughts": thinking_conf.get("include_thoughts", True)
-                }
+        # 只有显式传递了 thinking_config 才处理
+        if thinking_conf:
+            # 【修复】严格校验 Budget，防止出现 includeThoughts=True 但 Budget=0 导致的 400 错误
+            raw_budget = thinking_conf.get("thinking_budget")
+            budget = 1024 # 默认值
+            
+            # 尝试转换为整数
+            if raw_budget is not None:
+                try:
+                    budget = int(raw_budget)
+                except (ValueError, TypeError):
+                    budget = 1024
+            
+            include_thoughts = thinking_conf.get("include_thoughts", True)
+
+            # 关键逻辑：如果 budget <= 0，说明 Thinking 被禁用。
+            # 此时必须将 includeThoughts 强制设为 False，否则 Gemini API 会报错：
+            # "Thinking_config.include_thoughts is only enabled when thinking is enabled"
+            if budget <= 0:
+                include_thoughts = False
+            
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": budget,
+                "includeThoughts": include_thoughts
+            }
 
         payload = {
             "contents": contents,
@@ -251,7 +270,8 @@ class GeminiConverter:
                 
                 # 2. Text & Thinking
                 if "text" in part:
-                    # Gemini 2.0 Thinking 逻辑
+                    # Gemini 2.0 Thinking 逻辑: 检查 'thought' 字段
+                    # 注意：GCLI/Internal API 的返回结构可能将 thought 标记在 part 属性中
                     if part.get("thought", False):
                         reasoning_content += part["text"]
                     else:

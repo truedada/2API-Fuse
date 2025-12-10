@@ -8,8 +8,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# --- 辅助函数：解析 CORS 字符串 ---
-def parse_cors(v: Any) -> List[str] | str:
+def parse_cors(v: Any) -> list[str] | str:
     if isinstance(v, str) and not v.startswith("["):
         return [i.strip() for i in v.split(",")]
     elif isinstance(v, list | str):
@@ -61,6 +60,23 @@ class Settings(BaseSettings):
     MYSQL_DB: str = "2api_fuse"
 
     ADMIN_TOKEN: str = "123456"
+
+    PROXY_URL: str = ""
+
+    GOOGLE_AUTH_URL: str = "https://accounts.google.com/o/oauth2/auth"
+    GOOGLE_TOKEN_URL: str = "https://oauth2.googleapis.com/token"
+    GOOGLE_USERINFO_URL: str = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+    GOOGLE_CLIENT_ID: str = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com" 
+    GOOGLE_CLIENT_SECRET: str = "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"
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8081" # 默认回调地址
+
+    GOOGLE_SCOPES : List = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+
     # 【关键优化】自动计算数据库连接字符串
     @computed_field
     @property

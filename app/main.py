@@ -60,9 +60,10 @@ def create_app() -> FastAPI:
     # 注册中间件 - CORS
     # 使用配置文件中的 BACKEND_CORS_ORIGINS
     if settings.BACKEND_CORS_ORIGINS:
+        logger.info(f"允许的源: {settings.BACKEND_CORS_ORIGINS}")
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+            allow_origins = [str(origin).rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS],
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],

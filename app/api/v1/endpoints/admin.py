@@ -25,10 +25,26 @@ responses_doc = {
 router = APIRouter(prefix="/admin", tags=["Admin"], responses=responses_doc, dependencies=[Depends(verify_admin)])
 
 # =========================================================
+# Authentication 鉴权状态
+# =========================================================
+
+@router.get("/me", response_model=DataResponse[bool], operation_id="get_current_admin_identity")
+async def get_current_admin_identity(
+):
+    """
+    获取当前登录管理员信息
+    用于前端初始化时检查 Token 是否有效以及获取用户详情
+    """
+    # 如果 current_admin 是 ORM 对象，FastAPI 会自动根据 response_model 转换，
+    # 或者你需要手动转为 dict: return DataResponse(data=current_admin.dict())
+    return DataResponse(data=True, message="管理员身份验证成功")
+
+
+# =========================================================
 # Platform 平台管理 (全部 POST/GET)
 # =========================================================
 
-@router.get("/platforms", response_model=ListResponse[PlatformResponse])
+@router.get("/platforms", response_model=ListResponse[PlatformResponse], operation_id="list_platforms")
 async def list_platforms(
     service: AdminService = Depends(get_admin_service)
 ):
@@ -36,7 +52,7 @@ async def list_platforms(
     items = await service.get_platforms()
     return ListResponse(items=items, total=len(items), offset=0, limit=len(items))
 
-@router.post("/platforms", response_model=DataResponse[PlatformResponse])
+@router.post("/platforms", response_model=DataResponse[PlatformResponse], operation_id="create_platform")
 async def create_platform(
     payload: PlatformCreate,
     service: AdminService = Depends(get_admin_service)
@@ -45,7 +61,7 @@ async def create_platform(
     platform = await service.create_platform(payload)
     return DataResponse(data=platform)
 
-@router.post("/platforms/update", response_model=DataResponse[PlatformResponse])
+@router.post("/platforms/update", response_model=DataResponse[PlatformResponse], operation_id="update_platform")
 async def update_platform(
     payload: PlatformUpdate,
     service: AdminService = Depends(get_admin_service)
@@ -54,7 +70,7 @@ async def update_platform(
     platform = await service.update_platform(payload)
     return DataResponse(data=platform)
 
-@router.post("/platforms/delete", response_model=DataResponse[bool])
+@router.post("/platforms/delete", response_model=DataResponse[bool], operation_id="delete_platform")
 async def delete_platform(
     payload: IDRequest,
     service: AdminService = Depends(get_admin_service)
@@ -68,7 +84,7 @@ async def delete_platform(
 # Channel 渠道管理 (全部 POST/GET)
 # =========================================================
 
-@router.get("/channels", response_model=ListResponse[ChannelResponse])
+@router.get("/channels", response_model=ListResponse[ChannelResponse], operation_id="list_channels")
 async def list_channels(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -79,7 +95,7 @@ async def list_channels(
     items, total = await service.get_channels(limit=limit, offset=offset, platform_id=platform_id)
     return ListResponse(items=items, total=total, offset=offset, limit=limit)
 
-@router.post("/channels", response_model=DataResponse[ChannelResponse])
+@router.post("/channels", response_model=DataResponse[ChannelResponse], operation_id="create_channel")
 async def create_channel(
     payload: ChannelCreate,
     service: AdminService = Depends(get_admin_service)
@@ -91,7 +107,7 @@ async def create_channel(
     channel = await service.create_channel(payload)
     return DataResponse(data=channel)
 
-@router.post("/channels/upsert", response_model=DataResponse[ChannelResponse])
+@router.post("/channels/upsert", response_model=DataResponse[ChannelResponse], operation_id="upsert_channel")
 async def upsert_channel(
     payload: ChannelCreate,
     service: AdminService = Depends(get_admin_service)
@@ -103,7 +119,7 @@ async def upsert_channel(
     channel = await service.upsert_channel(payload)
     return DataResponse(data=channel)
 
-@router.post("/channels/update", response_model=DataResponse[ChannelResponse])
+@router.post("/channels/update", response_model=DataResponse[ChannelResponse], operation_id="update_channel")
 async def update_channel(
     payload: ChannelUpdate,
     service: AdminService = Depends(get_admin_service)
@@ -112,7 +128,7 @@ async def update_channel(
     channel = await service.update_channel(payload)
     return DataResponse(data=channel)
 
-@router.post("/channels/delete", response_model=DataResponse[bool])
+@router.post("/channels/delete", response_model=DataResponse[bool], operation_id="delete_channel")
 async def delete_channel(
     payload: IDRequest,
     service: AdminService = Depends(get_admin_service)
@@ -123,7 +139,7 @@ async def delete_channel(
 
 # --- 新增：管理功能接口 ---
 
-@router.post("/channels/{channel_id}/test", response_model=DataResponse[ChannelTestResponse])
+@router.post("/channels/{channel_id}/test", response_model=DataResponse[ChannelTestResponse], operation_id="test_channel_connectivity")
 async def test_channel_connectivity(
     channel_id: int = Path(..., title="Channel ID"),
     service: AdminService = Depends(get_admin_service)
@@ -134,7 +150,7 @@ async def test_channel_connectivity(
     result = await service.test_channel(channel_id)
     return DataResponse(data=result)
 
-@router.post("/channels/{channel_id}/sync_balance", response_model=DataResponse[Dict[str, Any]])
+@router.post("/channels/{channel_id}/sync_balance", response_model=DataResponse[Dict[str, Any]], operation_id="sync_channel_balance")
 async def sync_channel_balance(
     channel_id: int = Path(..., title="Channel ID"),
     service: AdminService = Depends(get_admin_service)
@@ -145,7 +161,7 @@ async def sync_channel_balance(
     result = await service.sync_channel_balance(channel_id)
     return DataResponse(data=result)
 
-@router.post("/channels/{channel_id}/refresh", response_model=DataResponse[Dict[str, Any]])
+@router.post("/channels/{channel_id}/refresh", response_model=DataResponse[Dict[str, Any]], operation_id="refresh_channel_session")
 async def refresh_channel_session(
     channel_id: int = Path(..., title="Channel ID"),
     service: AdminService = Depends(get_admin_service)
@@ -160,7 +176,7 @@ async def refresh_channel_session(
 # API Key 管理 (全部 POST/GET)
 # =========================================================
 
-@router.get("/apikeys", response_model=ListResponse[ApiKeyResponse])
+@router.get("/apikeys", response_model=ListResponse[ApiKeyResponse], operation_id="list_apikeys")
 async def list_apikeys(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -170,7 +186,7 @@ async def list_apikeys(
     items, total = await service.get_apikeys(limit=limit, offset=offset)
     return ListResponse(items=items, total=total, offset=offset, limit=limit)
 
-@router.post("/apikeys", response_model=DataResponse[ApiKeyResponse])
+@router.post("/apikeys", response_model=DataResponse[ApiKeyResponse], operation_id="create_apikey")
 async def create_apikey(
     payload: ApiKeyCreate,
     service: AdminService = Depends(get_admin_service)
@@ -179,7 +195,7 @@ async def create_apikey(
     apikey = await service.create_apikey(payload)
     return DataResponse(data=apikey)
 
-@router.post("/apikeys/update", response_model=DataResponse[ApiKeyResponse])
+@router.post("/apikeys/update", response_model=DataResponse[ApiKeyResponse], operation_id="update_apikey")
 async def update_apikey(
     payload: ApiKeyUpdate,
     service: AdminService = Depends(get_admin_service)
@@ -188,7 +204,7 @@ async def update_apikey(
     apikey = await service.update_apikey(payload)
     return DataResponse(data=apikey)
 
-@router.post("/apikeys/delete", response_model=DataResponse[bool])
+@router.post("/apikeys/delete", response_model=DataResponse[bool], operation_id="delete_apikey")
 async def delete_apikey(
     payload: IDRequest,
     service: AdminService = Depends(get_admin_service)
