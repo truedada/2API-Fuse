@@ -6,11 +6,14 @@ from app.repositories.channel import ChannelRepository
 from app.repositories.platform import PlatformRepository
 from app.repositories.apikey import ApiKeyRepository
 from app.core.redis.cache import CacheService
+from tortoise.expressions import Q
+from app.repositories.usage_log import UsageLogRepository
 from app.schemas.admin import (
     ChannelCreate, ChannelUpdate, ChannelTestResponse,
     PlatformCreate, PlatformUpdate,
     ApiKeyCreate, ApiKeyUpdate,
-    IDRequest
+    IDRequest,
+    UsageLogResponse
 )
 from app.core.exceptions.definitions import NotFound, ResourceConflict, InvalidInput, ExternalServiceError
 from app.adapters.base import BaseAdapter
@@ -27,11 +30,13 @@ class AdminService:
         self, 
         channel_repo: ChannelRepository, 
         platform_repo: PlatformRepository,
-        apikey_repo: ApiKeyRepository
+        apikey_repo: ApiKeyRepository,
+        usage_log_repo: UsageLogRepository
     ):
         self.channel_repo = channel_repo
         self.platform_repo = platform_repo
         self.apikey_repo = apikey_repo
+        self.usage_log_repo = usage_log_repo
 
     def _get_adapter(self, platform_data: Any, channel_data: Any) -> BaseAdapter:
         """
@@ -325,3 +330,84 @@ class AdminService:
         # 数据库物理删除
         await self.apikey_repo.delete(data.id)
         return True
+
+
+    async def get_usage_logs(
+        self, 
+        limit: int, 
+        offset: int, 
+        keyword: Optional[str] = None,
+        api_key_id: Optional[int] = None,
+        channel_id: Optional[int] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None
+    ) -> Tuple[List[UsageLogResponse], int]:
+        """
+        分页查询使用日志，支持多种筛选条件
+        """
+        # 1. 构建过滤条件
+        filters = Q()
+
+        if api_key_id:
+            filters &= Q(api_key_id=api_key_id)
+        
+        if channel_id:
+            filters &= Q(channel_id=channel_id)
+            
+        if start_time:
+            filters &= Q(created_at__gte=start_time)
+            
+        if end_time:
+            filters &= Q(created_at__lte=end_time)
+
+        if keyword:
+            # 模糊搜索：匹配模型名 或 trace_id
+            filters &= (Q(model_name__icontains=keyword) | Q(trace_id__icontains=keyword))
+
+        # 2. 查询总数
+        total = await self.usage_log_repo.count(filters)
+
+        # 3. 查询数据 (关联查询 api_key, channel, platform)
+        # 注意：Tortoise ORM 使用双下划线进行跨表关联 prefetch
+        # 我们需要在 Repository 中支持 filter 方法传入 prefetch 参数
+        logs = await self.usage_log_repo.filter(
+            filters,
+            limit=limit,
+            offset=offset,
+            order_by=["-created_at"],
+            prefetch=["api_key", "channel", "channel__platform"]
+        )
+
+        # 4. 转换为 Schema
+        result = []
+        for log in logs:
+            # 安全获取关联字段 (因为 on_delete=SET_NULL，可能为空)
+            ak_name = log.api_key.name if log.api_key else "未知/已删除"
+            ak_key = log.api_key.key if log.api_key else None
+            
+            ch_name = log.channel.name if log.channel else "未知/已删除"
+            
+            # channel__platform 表示获取 channel 下的 platform 对象
+            pf_name = "未知"
+            if log.channel and log.channel.platform:
+                pf_name = log.channel.platform.name
+
+            item = UsageLogResponse(
+                id=log.id,
+                trace_id=log.trace_id,
+                model_name=log.model_name,
+                prompt_tokens=log.prompt_tokens,
+                completion_tokens=log.completion_tokens,
+                total_tokens=log.total_tokens,
+                duration_ms=log.duration_ms,
+                is_stream=log.is_stream,
+                created_at=log.created_at,
+                # 填充关联名称
+                api_key_name=ak_name,
+                api_key_str=ak_key,
+                channel_name=ch_name,
+                platform_name=pf_name
+            )
+            result.append(item)
+
+        return result, total

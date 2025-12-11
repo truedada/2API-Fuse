@@ -6,13 +6,14 @@ from app.schemas.admin import (
     ChannelCreate, ChannelResponse, ChannelUpdate, ChannelTestResponse,
     PlatformCreate, PlatformResponse, PlatformUpdate,
     ApiKeyCreate, ApiKeyResponse, ApiKeyUpdate,
-    IDRequest
+    IDRequest,
+    UsageLogResponse
 )
 from app.schemas.error import APIErrorResponse
 from app.services.admin import AdminService
 from app.api.deps import get_admin_service
 from app.api.auth import verify_admin
-
+from datetime import datetime
 responses_doc = {
     400: {"model": APIErrorResponse, "description": "请求验证失败"},
     401: {"model": APIErrorResponse, "description": "未授权"},
@@ -212,3 +213,35 @@ async def delete_apikey(
     """删除 API Key"""
     success = await service.delete_apikey(payload)
     return DataResponse(data=success)
+
+@router.get("/logs", response_model=ListResponse[UsageLogResponse], operation_id="list_usage_logs")
+async def list_usage_logs(
+    limit: int = Query(20, ge=1, le=100, description="每页条数"),
+    offset: int = Query(0, ge=0, description="偏移量"),
+    keyword: Optional[str] = Query(None, description="搜索模型名或TraceID"),
+    api_key_id: Optional[int] = Query(None, description="按API Key ID筛选"),
+    channel_id: Optional[int] = Query(None, description="按渠道 ID筛选"),
+    start_time: Optional[datetime] = Query(None, description="开始时间"),
+    end_time: Optional[datetime] = Query(None, description="结束时间"),
+    service: AdminService = Depends(get_admin_service)
+):
+    """
+    分页查询 API 调用日志
+    支持按时间范围、关键字、渠道或 Key 筛选
+    """
+    items, total = await service.get_usage_logs(
+        limit=limit,
+        offset=offset,
+        keyword=keyword,
+        api_key_id=api_key_id,
+        channel_id=channel_id,
+        start_time=start_time,
+        end_time=end_time
+    )
+    
+    return ListResponse(
+        items=items, 
+        total=total, 
+        offset=offset, 
+        limit=limit
+    )

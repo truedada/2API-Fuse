@@ -292,7 +292,7 @@ class GeminiCliAdapter(BaseAdapter):
                             raw_chunk = json.loads(chunk_str)
                             # 5.2 解包 response 字段 (Internal API 特性)
                             # 原始数据可能是: { "response": { "candidates": ... } }
-                            logger.debug(raw_chunk)
+                            #logger.debug(raw_chunk)
                             actual_chunk = raw_chunk.get("response", raw_chunk)
                             
                             # 5.3 重新构造成 SSE 行字符串，供 Converter 解析

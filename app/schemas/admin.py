@@ -103,3 +103,24 @@ class ApiKeyResponse(BaseSchema):
     total_tokens: int
     is_active: bool
     created_at: datetime
+
+# --- [新增] Usage Log Schemas ---
+class UsageLogResponse(BaseSchema):
+    id: int
+    trace_id: Optional[str] = None
+    model_name: str
+    
+    # 统计数据
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    duration_ms: int
+    is_stream: bool
+    
+    # 关联信息 (为了前端展示方便，直接展开名称)
+    api_key_name: Optional[str] = Field(None, description="API Key 名称")
+    api_key_str: Optional[str] = Field(None, description="API Key 掩码或标识")
+    channel_name: Optional[str] = Field(None, description="渠道名称")
+    platform_name: Optional[str] = Field(None, description="所属平台名称")
+    
+    created_at: datetime

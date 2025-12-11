@@ -70,7 +70,19 @@ class GeminiConverter:
         for i, msg in enumerate(messages):
             role = msg.get("role")
             content = msg.get("content")
-            
+
+            # [最终修复] 提前处理无 ID 的孤儿 tool 消息
+            if role == "tool" and not msg.get("tool_call_id") and not msg.get("id"):
+                content_str = str(content)
+                if isinstance(content, (dict, list)):
+                    try:
+                        content_str = json.dumps(content, ensure_ascii=False)
+                    except:
+                        pass
+                parts = [{"text": f"[Tool Output]\n{content_str}"}]
+                contents.append({"role": "user", "parts": parts})
+                continue # 直接处理下一条消息，跳过所有会产生警告的逻辑
+
             # --- System Prompt 处理 ---
             # Gemini 将 system 放在顶层字段，而非 contents 数组
             if role == "system":
@@ -96,6 +108,9 @@ class GeminiConverter:
             if role == "tool":
                 # 【难点】Gemini 必须要有 function name，但 OpenAI 的 tool 消息只有 id。
                 tool_call_id = msg.get("tool_call_id")
+                # [修复] 增加对非标准 'id' 字段的兼容
+                if not tool_call_id:
+                    tool_call_id = msg.get("id")
                 
                 # 策略 1: 尝试从 msg 中获取 'name' (部分客户端如 Cherry Studio/NextChat 可能会透传)
                 func_name = msg.get("name")
@@ -139,7 +154,7 @@ class GeminiConverter:
                 # 绝对不能发送 name=None 或 name="unknown" 的 functionResponse，这会导致 Gemini 报错或幻觉。
                 # 此时我们将这条消息转换为普通的 User Text Message，保留内容但改变形式。
                 if not func_name:
-                    logger.warning(f"无法找到 Tool Response (ID: {tool_call_id}) 对应的函数名，降级为文本消息以避免报错。")
+                    logger.warning(f"无法找到 Tool Response (ID: {tool_call_id}) 对应的函数名，降级为文本消息以避免报错。问题消息: {msg}")
                     
                     # 尝试格式化内容为字符串
                     content_str = str(content)
@@ -501,6 +516,11 @@ class GeminiConverter:
                     if citations:
                         # 放在 delta.citations 字段，部分支持扩展字段的客户端可显示
                         delta["citations"] = citations
+
+                # [修复] 关键修复：如果存在工具调用，强制将 finish_reason 设为 tool_calls
+                # Gemini 经常在返回 FunctionCall 时同时返回 finishReason="STOP"，导致 OpenAI 客户端误判
+                if tool_calls_delta:
+                    finish_reason = "tool_calls"
 
                 # 构建 choices 列表
                 chunk_response["choices"].append({

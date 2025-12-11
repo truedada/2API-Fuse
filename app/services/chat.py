@@ -4,6 +4,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from loguru import logger
 import json
 import asyncio
+import time
+import uuid
 from typing import Dict, Any, Optional, List
 
 from app.schemas.chat import ChatCompletionRequest, ModelListResponse, ModelCard
@@ -11,6 +13,7 @@ from app.core.redis.cache import CacheService
 from app.adapters.factory import AdapterFactory
 from app.repositories.apikey import ApiKeyRepository
 from app.repositories.channel import ChannelRepository
+from app.services.usage_log import UsageLogService
 from app.core.exceptions.definitions import (
     PermissionDenied,
     ServiceUnavailable,
@@ -74,6 +77,11 @@ class ChatService:
         background_tasks: BackgroundTasks
     ):
         user_model_name = request.model
+        
+        # --- [NEW] 初始化计时与追踪 ---
+        start_time = time.time()
+        trace_id = str(uuid.uuid4())
+        # ----------------------------
 
         # -----------------------------------------------------------
         # 1. 鉴权与扣费 (Authentication & Billing)
@@ -108,7 +116,7 @@ class ChatService:
             raise ServiceUnavailable(detail=f"当前模型 {user_model_name} 无可用渠道")
 
         channel_id = channel_conf.get('id')
-        logger.info(f"路由: {user_model_name} -> 渠道ID: {channel_id}")
+        logger.info(f"[{trace_id}] 路由: {user_model_name} -> 渠道ID: {channel_id}")
 
         # -----------------------------------------------------------
         # 3. 初始化适配器 (Adapter Init)
@@ -152,16 +160,42 @@ class ChatService:
             req_dict['extra_body'] = request.extra_body
         if request.stream_options:
             req_dict['stream_options'] = request.stream_options.model_dump()
-        #logger.debug(f"流式输入：{req_dict}")
-        # --- 辅助任务：非流式使用记录 ---
-        async def record_usage_task(c_id: int, m_name: str, a_key: str, tokens: int = 0):
+        
+        # --- [修改] 统一的后台使用记录任务 (变量名已修正) ---
+        async def record_usage_task(
+            channel_id: int, 
+            model_name: str, 
+            api_key: str, 
+            prompt_tokens: int = 0, 
+            completion_tokens: int = 0,
+            total_tokens: int = 0,
+            is_stream_log: bool = False
+        ):
+            # 计算耗时
+            duration = int((time.time() - start_time) * 1000)
+            
             try:
-                # 记录渠道使用 (触发限流检查)
-                await CacheService.record_channel_usage(c_id, m_name)
-                if tokens > 0:
-                    logger.debug(f"记录非流式请求 Token: {tokens}")
-                    # 记录 Token 消耗
-                    await CacheService.record_apikey_tokens(a_key, tokens)
+                # 1. Redis: 记录渠道使用 (触发限流检查)
+                await CacheService.record_channel_usage(channel_id, model_name)
+                
+                # 2. Redis: 记录 Token 消耗 (用于计费)
+                if total_tokens > 0:
+                    logger.debug(f"[{trace_id}] 记录请求 Token: {total_tokens}")
+                    await CacheService.record_apikey_tokens(api_key, total_tokens)
+                
+                # 3. [新增] Database: 写入永久日志
+                await UsageLogService.log_transaction(
+                    api_key_str=api_key,
+                    channel_id=channel_id,
+                    model_name=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    duration_ms=duration,
+                    is_stream=is_stream_log,
+                    trace_id=trace_id
+                )
+
             except Exception as e:
                 logger.error(f"后台记录任务失败: {e}")
 
@@ -175,6 +209,9 @@ class ChatService:
 
             async def stream_wrapper(generator):
                 total_tokens_accumulated = 0
+                prompt_tokens_cnt = 0
+                completion_tokens_cnt = 0
+                
                 estimated_tokens = 0
                 has_error = False # 标记本次请求是否出错
                 usage_recorded = False # [修改] 标记是否已记录渠道使用
@@ -191,40 +228,44 @@ class ChatService:
 
                         # 尝试解码以在日志中正确显示中文
                         try:
-                            log_content = str(chunk).encode('latin1').decode('unicode_escape')
+                            # 仅用于 debug 日志展示
+                            # log_content = str(chunk).encode('latin1').decode('unicode_escape')
+                            pass
                         except Exception:
-                            log_content = chunk # 解码失败则记录原文
-                        logger.debug(f"Chat 流式返回: {log_content}")
-
+                            pass
+                        
                         yield chunk
 
                         # ### 尝试从 chunk 中解析 Token 信息 ###
-                        if '"usage"' in chunk and '"total_tokens"' in chunk:
+                        if '"usage"' in chunk:
                             try:
                                 clean_line = chunk.strip()
                                 if clean_line.startswith("data: "):
                                     json_str = clean_line[6:]
                                     if json_str != "[DONE]":
                                         data = json.loads(json_str)
-                                        if "usage" in data and data["usage"]:
-                                            total_tokens_accumulated = data["usage"].get("total_tokens", 0)
+                                        usage_data = data.get("usage", {})
+                                        if usage_data:
+                                            total_tokens_accumulated = usage_data.get("total_tokens", 0)
+                                            prompt_tokens_cnt = usage_data.get("prompt_tokens", 0)
+                                            completion_tokens_cnt = usage_data.get("completion_tokens", 0)
                             except Exception:
                                 pass
 
                         if total_tokens_accumulated == 0:
-                            estimated_tokens = 1
+                            estimated_tokens += 1 # 简单估算
 
                     # 如果能正常走完循环，说明没有抛出异常，视为成功，重置错误计数
                     # 使用 create_task 避免阻塞 generator 的结束
                     asyncio.create_task(CacheService.reset_channel_error(channel_id))
 
                 except (GeneratorExit, asyncio.CancelledError):
-                    logger.debug(f"客户端断开连接 (API Key: {api_key})")
+                    logger.debug(f"[{trace_id}] 客户端断开连接 (API Key: {api_key})")
 
                 except Exception as e:
                     has_error = True
                     error_msg = str(e)
-                    logger.error(f"流式传输过程中发生错误: {error_msg}")
+                    logger.error(f"[{trace_id}] 流式传输过程中发生错误: {error_msg}")
 
                     # --- 触发错误计数与熔断 ---
                     # 传入 user_model_name，确保从对应的 Redis 池中移除
@@ -245,18 +286,28 @@ class ChatService:
                     # ### 结算逻辑 ###
                     # 仅在未出错或有token时记录
                     if not has_error:
-                        final_tokens = total_tokens_accumulated
-                        if final_tokens == 0 and estimated_tokens > 0:
-                            final_tokens = estimated_tokens
+                        final_total = total_tokens_accumulated
+                        if final_total == 0 and estimated_tokens > 0:
+                            final_total = estimated_tokens
+                            completion_tokens_cnt = estimated_tokens # 估算全部为生成
 
-                        if final_tokens > 0:
+                        if final_total > 0:
                             # 【优化】使用 asyncio.create_task 实现 Fire-and-Forget
                             # 避免在此处 await 导致客户端等待服务器写入 Redis 完毕后才能关闭连接
                             # 这消除了请求结束时的延迟感
+                            
+                            # [修改] 调用统一的记录任务，同时写入 Redis 和 DB
                             asyncio.create_task(
-                                CacheService.record_apikey_tokens(api_key, final_tokens)
+                                record_usage_task(
+                                    channel_id=channel_id,
+                                    model_name=user_model_name,
+                                    api_key=api_key,
+                                    prompt_tokens=prompt_tokens_cnt,
+                                    completion_tokens=completion_tokens_cnt,
+                                    total_tokens=final_total,
+                                    is_stream_log=True
+                                )
                             )
-                            logger.debug(f"已异步提交流式请求 Token 记录: {final_tokens}")
 
             return StreamingResponse(
                 stream_wrapper(adapter.chat_completion_stream(req_dict)),
@@ -273,19 +324,32 @@ class ChatService:
             await CacheService.reset_channel_error(channel_id)
 
             total_tokens = 0
+            prompt_tokens = 0
+            completion_tokens = 0
+            
             usage = response_data.get("usage")
             if usage:
                 total_tokens = usage.get("total_tokens", 0)
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
 
             # 使用 BackgroundTask 记录使用情况
+            # [修改] 调用统一任务
             background_tasks.add_task(
-                record_usage_task, channel_id, user_model_name, api_key, total_tokens
+                record_usage_task, 
+                channel_id=channel_id, 
+                model_name=user_model_name, 
+                api_key=api_key, 
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                is_stream_log=False
             )
 
             return JSONResponse(content=response_data)
 
         except Exception as e:
-            logger.error(f"上游服务请求失败: {e}")
+            logger.error(f"[{trace_id}] 上游服务请求失败: {e}")
             # --- 触发错误计数与熔断 ---
             # 传入 user_model_name，确保从对应的 Redis 池中移除
             await ChatService._handle_channel_error(channel_id, str(e), model_name=user_model_name)
