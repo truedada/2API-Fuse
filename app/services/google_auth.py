@@ -14,6 +14,7 @@ from app.schemas.google_auth import (
     GoogleAuthCallbackRequest, 
     GoogleAuthCallbackResponse
 )
+from app.core.redis.cache import CacheService
 from app.core.exceptions.definitions import NotFound, ResourceConflict, ExternalServiceError, InvalidInput
 
 class GoogleAuthService:
@@ -352,7 +353,7 @@ class GoogleAuthService:
         }
         
         channel = await self.channel_repo.create(**new_channel_data)
-
+        await CacheService.sync_channel(channel.id)
         return GoogleAuthCallbackResponse(
             channel_id=channel.id,
             channel_name=channel.name,

@@ -6,7 +6,7 @@ import time
 import base64
 import httpx
 import re
-import hashlib  # 新增：用于生成稳定的 Tool Call ID
+import hashlib  # 用于生成稳定的 Tool Call ID
 from typing import List, Dict, Any, Optional, Union, Tuple
 from loguru import logger
 
@@ -19,8 +19,10 @@ class GeminiConverter:
     - 支持 Function Calling 双向转换
     - 支持 多模态 (图片 URL 自动转 Base64)
     - 严格的错误处理和日志记录
-    - [新增] 支持通过模型后缀 (-maxthinking, -nothinking) 自动控制思考预算
-    - [修复] 增强的 Tool Call ID 映射与流式 ID 稳定性
+    - 支持通过模型后缀 (-maxthinking, -nothinking) 自动控制思考预算
+    - [增强] 增强的 Tool Call ID 映射与流式 ID 稳定性
+    - [增强] 原生 Google Search 支持 (通过 web_search 工具触发)
+    - [增强] 严格的 JSON Schema 转换 (兼容 Node.js SDK 逻辑)
     """
 
     # Gemini 安全设置：默认全部放开，防止因安全策略导致的拒答
@@ -31,6 +33,11 @@ class GeminiConverter:
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
     ]
+
+    # Gemini Schema Type 枚举 (用于 Schema 规范化)
+    TYPE_ENUMS = {
+        "STRING", "NUMBER", "INTEGER", "BOOLEAN", "ARRAY", "OBJECT"
+    }
 
     # =========================================================================
     # Request Conversion (OpenAI -> Gemini)
@@ -97,16 +104,35 @@ class GeminiConverter:
                 if not func_name and tool_call_id:
                     func_name = tool_id_to_name_map.get(tool_call_id)
                 
-                # 策略 3: [修复] 容错回溯 (如果表里没有，或者 ID 为 None，尝试看上一条消息)
-                # 这种情况常见于 Claude Code 等客户端发送了不带 ID 的 tool 消息
+                # 策略 3: [增强] 基于顺序的容错回溯。
+                # 当 tool_call_id 缺失时 (常见于某些客户端)，我们假设 tool response 的顺序
+                # 与上一个 assistant 发出的 tool_calls 列表的顺序一致。
                 if not func_name:
-                    # 检查上一条消息是否是 assistant 且只有一个工具调用
-                    prev_msg = messages[i-1] if i > 0 else {}
-                    if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
-                        tcs = prev_msg["tool_calls"]
-                        if len(tcs) == 1:
-                            func_name = tcs[0]["function"]["name"]
-                            logger.warning(f"Tool ID {tool_call_id} 未在映射中找到，根据上下文推断为: {func_name}")
+                    last_assistant_tc_index = -1
+                    for j in range(i - 1, -1, -1):
+                        msg_j = messages[j]
+                        if msg_j.get("role") == "assistant" and msg_j.get("tool_calls"):
+                            last_assistant_tc_index = j
+                            break
+
+                    if last_assistant_tc_index != -1:
+                        assistant_tool_calls = messages[last_assistant_tc_index].get("tool_calls", [])
+
+                        # 计算自上次 assistant tool_calls 以来，这是第几个 "tool" 角色的消息
+                        tool_response_ordinal = 0
+                        for j in range(last_assistant_tc_index + 1, i + 1):
+                            if messages[j].get("role") == "tool":
+                                tool_response_ordinal += 1
+
+                        # 如果序号在有效范围内，则按顺序匹配函数名
+                        if 0 < tool_response_ordinal <= len(assistant_tool_calls):
+                            matched_tool_call = assistant_tool_calls[tool_response_ordinal - 1]
+                            func_name = matched_tool_call.get("function", {}).get("name")
+                            if func_name:
+                                logger.info(
+                                    f"Tool ID '{tool_call_id}' 缺失或未在映射中找到。"
+                                    f"根据消息顺序，成功推断为第 {tool_response_ordinal} 个工具调用: '{func_name}'"
+                                )
 
                 # --- [修复步骤 2] 智能降级处理 ---
                 # 如果经过上述所有策略仍然找不到 func_name (例如 ID 为 None 且无法推断)，
@@ -207,7 +233,7 @@ class GeminiConverter:
             stops = request_dict["stop"]
             generation_config["stopSequences"] = stops if isinstance(stops, list) else [stops]
 
-        # --- D. 处理 Thinking Config (核心修改) ---
+        # --- D. 处理 Thinking Config ---
         # 优先级：模型后缀变体 > 用户传入的 extra_body > 默认无
         
         final_budget = None
@@ -215,7 +241,6 @@ class GeminiConverter:
 
         if model_name.endswith("-maxthinking"):
             # 变体 1: 满血思考 (Max Budget)
-            # Gemini 2.0 目前最大支持 64k tokens 左右的思考，这里设为 64000 安全值
             if "flash" in model_name:
                 final_budget = 24576
             else:
@@ -263,16 +288,35 @@ class GeminiConverter:
         if system_instructions:
             payload["systemInstruction"] = {"parts": [{"text": "\n".join(system_instructions)}]}
 
-        # 3. 处理 Tools 定义
-        if request_dict.get("tools"):
-            gemini_tools = GeminiConverter._convert_tools_definition(request_dict["tools"])
-            if gemini_tools:
-                payload["tools"] = gemini_tools
-                
-            # 处理 tool_choice (Gemini 叫 toolConfig)
-            tool_choice = request_dict.get("tool_choice")
-            if tool_choice:
-                payload["toolConfig"] = GeminiConverter._convert_tool_choice(tool_choice)
+        # 3. 处理 Tools 定义 (包含 Function Calling 和 Web Search)
+        # [修改] 参考 Node.js 逻辑，分离常规工具和 Google Search 工具
+        tools_list = request_dict.get("tools")
+        if tools_list:
+            gemini_tools_payload = []
+            
+            # 检测是否请求了 Web Search (约定工具名: web_search, google_search, google_search_retrieval)
+            has_web_search = any(
+                t.get("function", {}).get("name") in ["web_search", "google_search", "google_search_retrieval"]
+                for t in tools_list
+            )
+            
+            # 转换常规 Function Calling
+            gemini_funcs = GeminiConverter._convert_tools_definition(tools_list)
+            if gemini_funcs:
+                # 注意：在 Gemini 的 tools 列表中，function_declarations 和 googleSearch 是并列的对象
+                gemini_tools_payload.append({"function_declarations": gemini_funcs})
+            
+            # 如果请求了 Web Search，添加原生 Google Search 工具
+            if has_web_search:
+                gemini_tools_payload.append({"googleSearch": {}})
+
+            if gemini_tools_payload:
+                payload["tools"] = gemini_tools_payload
+
+                # 处理 tool_choice (Gemini 叫 toolConfig)
+                tool_choice = request_dict.get("tool_choice")
+                if tool_choice:
+                    payload["toolConfig"] = GeminiConverter._convert_tool_choice(tool_choice)
 
         return payload
 
@@ -327,7 +371,6 @@ class GeminiConverter:
                 # 2. Text & Thinking
                 if "text" in part:
                     # Gemini 2.0 Thinking 逻辑: 检查 'thought' 字段
-                    # 注意：GCLI/Internal API 的返回结构可能将 thought 标记在 part 属性中
                     if part.get("thought", False):
                         reasoning_content += part["text"]
                     else:
@@ -343,6 +386,14 @@ class GeminiConverter:
                 message["reasoning_content"] = reasoning_content
             if tool_calls:
                 message["tool_calls"] = tool_calls
+
+            # [新增] 处理非流式的 Grounding Metadata (Citation)
+            grounding_metadata = candidate.get("groundingMetadata")
+            if grounding_metadata:
+                # OpenAI 没有标准引用字段，这里放在 message 的 extensions 字段或 context 中
+                # 为了兼容性，这里暂不强行修改 content，仅做记录。
+                # 如果需要，可以将引用追加到 content 文本末尾。
+                pass
 
             choices.append({
                 "index": idx,
@@ -396,6 +447,9 @@ class GeminiConverter:
                 parts = candidate.get("content", {}).get("parts", [])
                 finish_reason = GeminiConverter._map_finish_reason(candidate.get("finishReason"))
                 
+                # [新增] 获取 Grounding Metadata (搜索来源)
+                grounding_metadata = candidate.get("groundingMetadata")
+                
                 delta = {}
                 content_delta = ""
                 reasoning_delta = ""
@@ -409,8 +463,7 @@ class GeminiConverter:
                         
                         # --- [修复步骤 3] 生成稳定的 Tool Call ID ---
                         # 在流式传输中，同一个工具调用的 ID 必须保持一致。
-                        # 由于 parse_gemini_stream_chunk 是无状态的，我们使用 hash(req_id + func_name) 来生成确定性 ID。
-                        # 这样即使 Gemini 分多次返回，或者客户端重新拼接，ID 也是固定的。
+                        # 使用 hash(req_id + func_name) 来生成确定性 ID。
                         hash_input = f"{req_id}_{func_name}"
                         stable_id = f"call_{hashlib.md5(hash_input.encode()).hexdigest()[:10]}"
 
@@ -435,6 +488,20 @@ class GeminiConverter:
                 if reasoning_delta: delta["reasoning_content"] = reasoning_delta
                 if tool_calls_delta: delta["tool_calls"] = tool_calls_delta
                 
+                # [新增] 处理 Web Search 引用 (放入 delta 扩展字段)
+                if grounding_metadata:
+                    citations = []
+                    for chunk in grounding_metadata.get("groundingChunks", []):
+                        if "web" in chunk:
+                            citations.append({
+                                "url": chunk["web"].get("uri"),
+                                "title": chunk["web"].get("title"),
+                                "text": "Web Source"
+                            })
+                    if citations:
+                        # 放在 delta.citations 字段，部分支持扩展字段的客户端可显示
+                        delta["citations"] = citations
+
                 # 构建 choices 列表
                 chunk_response["choices"].append({
                     "index": 0,
@@ -443,7 +510,7 @@ class GeminiConverter:
                 })
             
             # 3. 验证返回有效性
-            # 如果既没有 choices (content) 也没有 usage，则视为无效 Chunk (OpenAI 客户端通常不喜欢空 choices 且无 usage 的包)
+            # 如果既没有 choices (content) 也没有 usage，则视为无效 Chunk
             if not chunk_response["choices"] and "usage" not in chunk_response:
                 return None
 
@@ -499,58 +566,142 @@ class GeminiConverter:
     def _convert_tools_definition(openai_tools: List[Dict]) -> List[Dict]:
         """
         OpenAI Tools -> Gemini FunctionDeclarations
-        清洗掉 Gemini 不支持的 schema 字段
+        清洗掉 Gemini 不支持的 schema 字段，并过滤掉已处理的 web_search
         """
         funcs = []
         for t in openai_tools:
             if t.get("type") != "function":
                 continue
+            
+            func_name = t.get("function", {}).get("name")
+            
+            # [修改] 如果是 web_search 类工具，跳过（因为已经在上层 payload 处理为 googleSearch）
+            if func_name in ["web_search", "google_search", "google_search_retrieval"]:
+                continue
                 
             f_def = t.get("function", {})
             params = f_def.get("parameters", {})
             
-            # 清洗 parameters (Gemini 极其挑剔)
-            cleaned_params = GeminiConverter._clean_schema(params)
+            # [修改] 使用增强的 Schema 处理逻辑
+            cleaned_params = GeminiConverter._process_json_schema(params)
             
             funcs.append({
-                "name": f_def.get("name"),
+                "name": func_name,
                 "description": f_def.get("description"),
                 "parameters": cleaned_params
             })
             
-        return [{"function_declarations": funcs}] if funcs else []
+        return funcs
 
     @staticmethod
-    def _clean_schema(schema: Dict) -> Dict:
+    def _process_json_schema(schema: Dict) -> Dict:
         """
-        递归清洗 JSON Schema，移除 Gemini 不支持的关键字
+        [新增] 深度清洗并转换 JSON Schema 以适配 Gemini (参考 Node.js SDK 逻辑)
+        1. 处理 type: ["string", "null"] -> nullable: true
+        2. 将类型转换为大写 (string -> STRING)
+        3. 处理 anyOf 中包含 null 的情况
+        4. 递归处理 properties 和 items
         """
         if not isinstance(schema, dict):
             return schema
-            
-        # Gemini 不支持的关键字黑名单
-        UNSUPPORTED_KEYS = [
-            "title", "default", "examples", "example", 
-            "additionalProperties", "$schema", "strict"
-        ]
-        
-        clean = {}
-        for k, v in schema.items():
-            if k in UNSUPPORTED_KEYS:
-                continue
-            
-            if k == "type" and v == "object" and "properties" not in schema:
-                 # Gemini 不喜欢空的 object 定义，有时需要处理
-                 pass
 
-            if isinstance(v, dict):
-                clean[k] = GeminiConverter._clean_schema(v)
-            elif isinstance(v, list):
-                clean[k] = [GeminiConverter._clean_schema(i) if isinstance(i, dict) else i for i in v]
-            else:
-                clean[k] = v
+        gen_ai_schema = {}
         
-        return clean
+        # 1. 提取并转换 Type
+        original_type = schema.get("type")
+        
+        if original_type:
+            if isinstance(original_type, list):
+                # 处理数组类型 (e.g., ["string", "null"])
+                GeminiConverter._flatten_type_array(original_type, gen_ai_schema)
+            elif original_type == "null":
+                # 单独的 null 类型是不允许的，但在 logic 中可能会被上层 anyOf 处理
+                pass
+            else:
+                # 单个类型转大写
+                upper_type = original_type.upper()
+                gen_ai_schema["type"] = upper_type if upper_type in GeminiConverter.TYPE_ENUMS else "TYPE_UNSPECIFIED"
+
+        # 2. 处理 Nullable (如果 schema 本身标记了 nullable)
+        if schema.get("nullable"):
+            gen_ai_schema["nullable"] = True
+
+        # 3. 处理 anyOf (特别是处理 {anyOf: [{type: null}, {type: object}]})
+        if "anyOf" in schema:
+            any_of = schema["anyOf"]
+            # 简单启发式：如果是 2 个元素且其中一个是 null，则转为 nullable
+            if isinstance(any_of, list) and len(any_of) == 2:
+                is_null_0 = any_of[0].get("type") == "null"
+                is_null_1 = any_of[1].get("type") == "null"
+                
+                if is_null_0:
+                    gen_ai_schema["nullable"] = True
+                    # 递归处理另一个非 null 的 schema，合并其属性
+                    merged = GeminiConverter._process_json_schema(any_of[1])
+                    gen_ai_schema.update(merged)
+                    return gen_ai_schema # 直接返回合并结果
+                elif is_null_1:
+                    gen_ai_schema["nullable"] = True
+                    merged = GeminiConverter._process_json_schema(any_of[0])
+                    gen_ai_schema.update(merged)
+                    return gen_ai_schema
+
+            # 如果不是 null pattern，则递归处理 list
+            gen_ai_schema["anyOf"] = [GeminiConverter._process_json_schema(item) for item in any_of]
+
+        # 4. 递归处理 properties, items
+        if "properties" in schema:
+            gen_ai_schema["properties"] = {
+                k: GeminiConverter._process_json_schema(v) 
+                for k, v in schema["properties"].items()
+            }
+            
+        if "items" in schema:
+            # items 可能是 dict 或 list
+            if isinstance(schema["items"], dict):
+                gen_ai_schema["items"] = GeminiConverter._process_json_schema(schema["items"])
+            elif isinstance(schema["items"], list):
+                # Gemini 不太支持 items 为数组 (Tuple validation)，但尽量转换
+                gen_ai_schema["items"] = [GeminiConverter._process_json_schema(i) for i in schema["items"]]
+
+        # 5. 复制其他重要字段 (并过滤黑名单)
+        # Gemini 不支持: title, default, examples, additionalProperties, $schema
+        ALLOWED_KEYS = ["description", "required", "enum", "format"]
+        for k in ALLOWED_KEYS:
+            if k in schema:
+                gen_ai_schema[k] = schema[k]
+        
+        # 6. 处理 enum 的值 (Gemini 要求 enum 必须与 type 匹配，通常是 STRING)
+        if "enum" in gen_ai_schema and "type" not in gen_ai_schema:
+             # 如果有 enum 但没 type，通常推断为 STRING
+             gen_ai_schema["type"] = "STRING"
+
+        return gen_ai_schema
+
+    @staticmethod
+    def _flatten_type_array(type_list: List[str], schema_obj: Dict):
+        """
+        [新增] 将类型数组转换为 Gemini 兼容格式
+        ["string", "null"] -> type="STRING", nullable=True
+        ["string", "integer"] -> anyOf=[{type: STRING}, {type: INTEGER}]
+        """
+        # 1. 检查是否包含 null
+        if "null" in type_list:
+            schema_obj["nullable"] = True
+        
+        # 2. 过滤掉 null
+        valid_types = [t for t in type_list if t != "null"]
+        
+        if len(valid_types) == 1:
+            upper = valid_types[0].upper()
+            schema_obj["type"] = upper if upper in GeminiConverter.TYPE_ENUMS else "TYPE_UNSPECIFIED"
+        elif len(valid_types) > 1:
+            # 多个非 null 类型，必须转为 anyOf
+            schema_obj["anyOf"] = []
+            for t in valid_types:
+                upper = t.upper()
+                t_val = upper if upper in GeminiConverter.TYPE_ENUMS else "TYPE_UNSPECIFIED"
+                schema_obj["anyOf"].append({"type": t_val})
 
     @staticmethod
     def _convert_tool_choice(tool_choice: Union[str, Dict]) -> Dict:
