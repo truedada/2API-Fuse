@@ -254,7 +254,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {
@@ -271,7 +271,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {
@@ -288,7 +288,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {
@@ -305,7 +305,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {
@@ -322,7 +322,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {
@@ -339,7 +339,7 @@ class GoogleAuthService:
     },
     {
       "period": 86400,
-      "count": 100,
+      "count": 400,
       "group": "pro_1d_limit"
     },
     {

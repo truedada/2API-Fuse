@@ -6,6 +6,7 @@ import time
 import base64
 import httpx
 import re
+import hashlib  # 新增：用于生成稳定的 Tool Call ID
 from typing import List, Dict, Any, Optional, Union, Tuple
 from loguru import logger
 
@@ -19,6 +20,7 @@ class GeminiConverter:
     - 支持 多模态 (图片 URL 自动转 Base64)
     - 严格的错误处理和日志记录
     - [新增] 支持通过模型后缀 (-maxthinking, -nothinking) 自动控制思考预算
+    - [修复] 增强的 Tool Call ID 映射与流式 ID 稳定性
     """
 
     # Gemini 安全设置：默认全部放开，防止因安全策略导致的拒答
@@ -45,6 +47,18 @@ class GeminiConverter:
         contents = []
         system_instructions = []
         
+        # --- [修复步骤 1] 建立全局 Tool ID 到 Function Name 的映射 ---
+        # OpenAI 的 tool 消息只带 ID，Gemini 需要 Name。
+        # 简单的回溯查找容易失败，这里预先扫描所有 assistant 消息，记录下 ID 和 Name 的对应关系。
+        tool_id_to_name_map = {}
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    t_id = tc.get("id")
+                    f_name = tc.get("function", {}).get("name")
+                    if t_id and f_name:
+                        tool_id_to_name_map[t_id] = f_name
+
         # 1. 遍历消息列表
         for i, msg in enumerate(messages):
             role = msg.get("role")
@@ -74,21 +88,47 @@ class GeminiConverter:
             # Gemini 格式: role="user", parts=[{functionResponse: {name: "func_name", response: {...}}}]
             if role == "tool":
                 # 【难点】Gemini 必须要有 function name，但 OpenAI 的 tool 消息只有 id。
+                tool_call_id = msg.get("tool_call_id")
+                
                 # 策略 1: 尝试从 msg 中获取 'name' (部分客户端如 Cherry Studio/NextChat 可能会透传)
                 func_name = msg.get("name")
                 
-                # 策略 2: 如果没有 name，我们需要回溯历史找到对应的 tool_call (这在无状态转换中很难)
-                # 这里使用一个占位符或尝试从 content 推断，或者依赖调用方保证 name 存在
-                if not func_name:
-                    # 尝试在 request 历史中根据 tool_call_id 反查 (简单的回溯)
-                    tool_call_id = msg.get("tool_call_id")
-                    if tool_call_id:
-                        func_name = GeminiConverter._find_function_name_by_id(messages[:i], tool_call_id)
+                # 策略 2: [修复] 使用全局映射表查找 (最准确的方式)
+                if not func_name and tool_call_id:
+                    func_name = tool_id_to_name_map.get(tool_call_id)
                 
+                # 策略 3: [修复] 容错回溯 (如果表里没有，或者 ID 为 None，尝试看上一条消息)
+                # 这种情况常见于 Claude Code 等客户端发送了不带 ID 的 tool 消息
                 if not func_name:
-                    func_name = "unknown_function" # 兜底，防止报错，但在 Gemini 端可能会因为找不到函数而导致幻觉
-                    logger.warning(f"无法找到 Tool Response 对应的函数名，使用默认值: {tool_call_id}")
+                    # 检查上一条消息是否是 assistant 且只有一个工具调用
+                    prev_msg = messages[i-1] if i > 0 else {}
+                    if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                        tcs = prev_msg["tool_calls"]
+                        if len(tcs) == 1:
+                            func_name = tcs[0]["function"]["name"]
+                            logger.warning(f"Tool ID {tool_call_id} 未在映射中找到，根据上下文推断为: {func_name}")
 
+                # --- [修复步骤 2] 智能降级处理 ---
+                # 如果经过上述所有策略仍然找不到 func_name (例如 ID 为 None 且无法推断)，
+                # 绝对不能发送 name=None 或 name="unknown" 的 functionResponse，这会导致 Gemini 报错或幻觉。
+                # 此时我们将这条消息转换为普通的 User Text Message，保留内容但改变形式。
+                if not func_name:
+                    logger.warning(f"无法找到 Tool Response (ID: {tool_call_id}) 对应的函数名，降级为文本消息以避免报错。")
+                    
+                    # 尝试格式化内容为字符串
+                    content_str = str(content)
+                    if isinstance(content, (dict, list)):
+                        try:
+                            content_str = json.dumps(content, ensure_ascii=False)
+                        except:
+                            pass
+                    
+                    # 构造一个带标识的文本消息，让模型知道这是工具输出
+                    parts.append({"text": f"[Tool Output]\n{content_str}"})
+                    contents.append({"role": "user", "parts": parts})
+                    continue
+
+                # 如果找到了函数名，正常构造 functionResponse
                 try:
                     # Gemini 要求 response 必须是 Object，不能是 String
                     if isinstance(content, str):
@@ -97,7 +137,7 @@ class GeminiConverter:
                         except json.JSONDecodeError:
                             response_obj = {"result": content}
                     else:
-                        response_obj = content
+                        response_obj = content if content is not None else {"result": "success"}
                 except Exception:
                     response_obj = {"result": str(content)}
 
@@ -365,12 +405,21 @@ class GeminiConverter:
                     # 处理流式工具调用
                     if "functionCall" in part:
                         fc = part["functionCall"]
+                        func_name = fc.get("name", "unknown")
+                        
+                        # --- [修复步骤 3] 生成稳定的 Tool Call ID ---
+                        # 在流式传输中，同一个工具调用的 ID 必须保持一致。
+                        # 由于 parse_gemini_stream_chunk 是无状态的，我们使用 hash(req_id + func_name) 来生成确定性 ID。
+                        # 这样即使 Gemini 分多次返回，或者客户端重新拼接，ID 也是固定的。
+                        hash_input = f"{req_id}_{func_name}"
+                        stable_id = f"call_{hashlib.md5(hash_input.encode()).hexdigest()[:10]}"
+
                         tool_calls_delta.append({
                             "index": 0,
-                            "id": f"call_{uuid.uuid4().hex[:9]}", # 流式 ID 需要保持一致，但在简单转换中随机
+                            "id": stable_id, # 使用稳定 ID
                             "type": "function",
                             "function": {
-                                "name": fc.get("name"),
+                                "name": func_name,
                                 "arguments": json.dumps(fc.get("args", {}))
                             }
                         })
@@ -523,18 +572,6 @@ class GeminiConverter:
                     }
                 }
         return {}
-
-    @staticmethod
-    def _find_function_name_by_id(messages: List[Dict], call_id: str) -> Optional[str]:
-        """
-        简易回溯：在历史 assistant 消息中查找 tool_calls id 对应的 name
-        """
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    if tc.get("id") == call_id:
-                        return tc.get("function", {}).get("name")
-        return None
 
     @staticmethod
     def _map_usage(gemini_usage: Dict) -> Dict:

@@ -307,9 +307,7 @@ class SchedulerService:
     async def _reset_expired_quotas(self):
         """
         重置任务：查询 next_reset_time <= now 的渠道
-        【优化策略】：如果渠道在过期周期内没有使用（count=0），则不执行重置动作，
-        并将其 next_reset_time 设为 0，停止调度，直到下一次有真实调用触发更新。
-        【修改】支持 Group 限流，清理 Redis Key 时使用 Bucket Name
+        【修复版】分离“数据重置”与“模型复活”逻辑，解决分组限流导致的死锁问题
         """
         try:
             now = int(time.time())
@@ -323,7 +321,6 @@ class SchedulerService:
             
             if not channels:
                 return
-
             client = await get_redis_client()
             pipeline = client.pipeline()
             has_redis_ops = False
@@ -333,86 +330,112 @@ class SchedulerService:
                 progress = ch.usage_progress or {}
                 limits_map = ch.rate_limits or {}
                 
-                min_next_reset = float('inf')
                 db_dirty = False
-                channel_was_reset = False # 标记该渠道本次是否发生了实际的额度恢复
+                # 标记该渠道是否发生了重置操作
+                channel_has_reset = False 
                 
+                # --- 第一步：重置过期的数据 (Bucket Level) ---
+                # 我们需要遍历所有模型的所有规则，找到过期的 Bucket 进行重置
+                # 使用 Set 避免重复处理同一个 Group Bucket
+                processed_buckets = set()
                 for model in ch.supported_models:
                     rules = limits_map.get(model) or limits_map.get('default', [])
                     if not rules: continue
                     
                     for rule in rules:
-                        # 【核心修改】确定 Bucket Key
                         bucket_name = rule.get('group') or model
-                        
                         period = str(rule['period'])
+                        bucket_key = f"{bucket_name}:{period}"
                         
-                        # 获取对应的进度 bucket (注意：这里是从 progress[bucket_name] 获取)
+                        if bucket_key in processed_buckets:
+                            continue
+                        
+                        processed_buckets.add(bucket_key)
+                        # 获取 Bucket 数据
                         bucket_prog = progress.get(bucket_name, {})
                         bucket = bucket_prog.get(period, {"count": 0, "last_reset": 0})
                         
                         last_reset = bucket.get('last_reset', 0)
                         count = bucket.get('count', 0)
                         
-                        # 检查是否到期
+                        # 检查是否过期
                         if now - last_reset >= int(period):
-                            # 只有当 count > 0 时，才执行“重置”动作
                             if count > 0:
+                                # 执行重置
                                 bucket['count'] = 0
                                 bucket['last_reset'] = now
                                 db_dirty = True
-                                channel_was_reset = True
+                                channel_has_reset = True
                                 
-                                # 【核心修改】清理 Redis 计数器，使用 bucket_name
+                                # 清理 Redis 计数器
                                 usage_key = CacheKeys.channel_usage(ch.id, bucket_name, int(period))
                                 pipeline.delete(usage_key)
-                                
-                                # 复活策略
-                                pipeline.sadd(CacheKeys.available_pool(model), ch.id)
                                 has_redis_ops = True
                                 
-                                # 重置后，新的下次到期时间是 now + period
-                                next_due = now + int(period)
-                            else:
-                                # Count 为 0，不更新 last_reset。
-                                next_due = float('inf') 
-                        else:
-                            # 未到期
-                            if count > 0:
-                                next_due = last_reset + int(period)
-                            else:
-                                next_due = float('inf')
+                                # 写回内存字典
+                                bucket_prog[period] = bucket
+                                progress[bucket_name] = bucket_prog
+                # --- 第二步：计算新的 next_reset_time ---
+                min_next_reset = float('inf')
+                for model in ch.supported_models:
+                    rules = limits_map.get(model) or limits_map.get('default', [])
+                    for rule in rules:
+                        bucket_name = rule.get('group') or model
+                        period = int(rule['period'])
                         
-                        # 维护全局最小重置时间
-                        if next_due < min_next_reset:
-                            min_next_reset = next_due
+                        # 读取（可能已被重置的）进度
+                        bucket = progress.get(bucket_name, {}).get(str(period), {})
+                        count = bucket.get("count", 0)
+                        last_reset = bucket.get("last_reset", now)
+                        
+                        if count > 0:
+                            # 只有还有计数的 Bucket 才需要计算下次重置时间
+                            next_due = last_reset + period
+                            if next_due < min_next_reset:
+                                min_next_reset = next_due
+                
+                # --- 第三步：复活模型 (Model Level) ---
+                # 如果发生了重置，或者为了保险起见，重新检查所有模型的可用性
+                # 只要模型当前未被任何规则封禁，就将其加入 Redis Pool
+                if channel_has_reset:
+                    reset_count += 1
+                    for model in ch.supported_models:
+                        rules = limits_map.get(model) or limits_map.get('default', [])
+                        is_banned = False
+                        
+                        for rule in rules:
+                            bucket_name = rule.get('group') or model
+                            period = str(rule['period'])
+                            limit = rule['count']
                             
-                        # 写回内存结构
-                        bucket_prog[period] = bucket
-                        progress[bucket_name] = bucket_prog
-
-                # 保存逻辑
+                            current_count = progress.get(bucket_name, {}).get(period, {}).get("count", 0)
+                            if current_count >= limit:
+                                is_banned = True
+                                break
+                        
+                        if not is_banned:
+                            # 复活！
+                            pipeline.sadd(CacheKeys.available_pool(model), ch.id)
+                            has_redis_ops = True
+                # --- 第四步：保存数据库 ---
                 updates = {}
                 if db_dirty:
                     updates['usage_progress'] = progress
                 
-                # 计算新的 DB 索引字段 next_reset_time
                 new_next = min_next_reset if min_next_reset != float('inf') else 0
-                
                 if new_next != ch.next_reset_time:
                     updates['next_reset_time'] = new_next
-                    db_dirty = True 
+                    db_dirty = True
                 
                 if db_dirty:
                     await Channel.filter(id=ch.id).update(**updates)
-                    if channel_was_reset:
-                        reset_count += 1
             
             if has_redis_ops:
                 await pipeline.execute()
                 
             if reset_count > 0:
-                logger.info(f"重置了 {reset_count} 个渠道的额度 (跳过空闲渠道 {len(channels) - reset_count} 个)")
-
+                logger.info(f"重置了 {reset_count} 个渠道的额度并刷新了模型池")
         except Exception as e:
             logger.error(f"执行 _reset_expired_quotas 时出错: {e}")
+            import traceback
+            logger.error(traceback.format_exc())

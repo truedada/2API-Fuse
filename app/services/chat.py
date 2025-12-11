@@ -152,7 +152,7 @@ class ChatService:
             req_dict['extra_body'] = request.extra_body
         if request.stream_options:
             req_dict['stream_options'] = request.stream_options.model_dump()
-
+        #logger.debug(f"流式输入：{req_dict}")
         # --- 辅助任务：非流式使用记录 ---
         async def record_usage_task(c_id: int, m_name: str, a_key: str, tokens: int = 0):
             try:
@@ -188,7 +188,7 @@ class ChatService:
                             usage_recorded = True
                             # 使用 asyncio.create_task 异步记录，不阻塞流
                             asyncio.create_task(CacheService.record_channel_usage(channel_id, user_model_name))
-
+                        logger.debug(f"Chat 流式返回: {chunk}")
                         yield chunk
                         
                         # ### 尝试从 chunk 中解析 Token 信息 ###
