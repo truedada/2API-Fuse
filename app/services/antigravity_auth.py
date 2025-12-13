@@ -2,13 +2,14 @@
 from typing import Dict, Any, Optional, Tuple
 from app.services.base_google_oauth import BaseGoogleOAuthService
 from app.utils.google_oauth_api import GoogleOAuth2Helper
+from app.core.config import settings
 
 class AntigravityAuthService(BaseGoogleOAuthService):
     # --- Antigravity Constants ---
-    CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-    CLIENT_SECRET = "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"
-    # 默认回调地址，通常本地代理工具会监听这个端口
-    DEFAULT_REDIRECT_URI = "http://localhost:8080"
+    client_id = settings.ANTIGRAVITY_CLIENT_ID or "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+    client_secret = settings.ANTIGRAVITY_CLIENT_SECRET or "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"
+        # 必须是 localhost，且端口要与实际监听的一致，通常是 8080
+    redirect_uri = settings.GOOGLE_REDIRECT_URI or "http://localhost:8080"
     
     def get_oauth_config(self) -> Dict[str, Any]:
         # Antigravity 专用 Scopes
@@ -22,9 +23,9 @@ class AntigravityAuthService(BaseGoogleOAuthService):
         ]
         
         return {
-            "client_id": self.CLIENT_ID,
-            "client_secret": self.CLIENT_SECRET,
-            "redirect_uri": self.DEFAULT_REDIRECT_URI,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": self.redirect_uri,
             "scopes": scopes
         }
 

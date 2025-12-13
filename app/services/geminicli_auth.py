@@ -13,8 +13,8 @@ class GeminiCliAuthService(BaseGoogleOAuthService):
         """
         # 如果环境变量没有配置，这里提供默认的 Gemini CLI 配置作为兜底
         # 这是 Cloud Code (Gemini Code Assist) 的公开 Client ID
-        client_id = settings.GOOGLE_CLIENT_ID or "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
-        client_secret = settings.GOOGLE_CLIENT_SECRET or "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"
+        client_id = settings.GEMINICLI_CLIENT_ID or "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+        client_secret = settings.GEMINICLI_CLIENT_SECRET or "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"
         # 必须是 localhost，且端口要与实际监听的一致，通常是 8080
         redirect_uri = settings.GOOGLE_REDIRECT_URI or "http://localhost:8080"
 
