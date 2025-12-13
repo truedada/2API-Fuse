@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     DB_TYPE: Literal["sqlite", "mysql"] = "mysql"
     
     # SQLite 配置
-    SQLITE_FILE: str = "db.sqlite3"
+    SQLITE_FILE: str = "data/db.sqlite3"
     
     # MySQL 配置
     MYSQL_SERVER: str = "localhost"
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     MYSQL_PASSWORD: str = "123456"
     MYSQL_DB: str = "2api_fuse"
 
-    ADMIN_TOKEN: str = "123456"
+    ADMIN_TOKEN: str
 
     PROXY_URL: str = ""
 

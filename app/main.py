@@ -1,6 +1,7 @@
 import contextlib
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -76,7 +77,8 @@ def create_app() -> FastAPI:
     # 注册路由
     # 建议使用 include_router 包含 v1 下的所有路由
     app.include_router(api_router)
-    
+    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+    logger.info("静态文件目录已挂载到根路径 '/'。")
     return app
 
 app = create_app()

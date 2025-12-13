@@ -1,0 +1,165 @@
+version: '3.8'
+
+# ========================================
+# 网络配置
+# ========================================
+networks:
+  2api-network:
+    driver: bridge
+
+# ========================================
+# 数据卷配置 - 重要！这些卷用于持久化数据
+# ========================================
+# ⚠️ 警告：这些卷存储了所有重要数据，删除会导致数据丢失！
+#
+# 卷说明：
+# - mysql-data: MySQL 数据库文件 (如果使用 MySQL)
+# - redis-data: Redis 持久化数据 (如果使用 Redis)
+# - app-data: 应用数据，包括 SQLite 数据库文件
+# - app-logs: 应用日志文件
+#
+# 查看卷：docker volume ls
+# 备份卷：见 README.Docker.md 的"数据备份"章节
+# ⚠️ 删除卷会导致数据永久丢失，请谨慎操作！
+volumes:
+  mysql-data:
+    driver: local
+  redis-data:
+    driver: local
+  app-data:
+    driver: local
+  app-logs:
+    driver: local
+
+# ========================================
+# 服务配置
+# ========================================
+services:
+  # ========================================
+  # MySQL 服务 (可选)
+  # 使用方式: docker-compose --profile mysql up
+  # ========================================
+  mysql:
+    image: mysql:8.0
+    profiles:
+      - mysql
+      - full
+    container_name: 2api-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DB:-2api_db}
+      MYSQL_USER: ${MYSQL_USER:-apiuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-root}
+      TZ: Asia/Shanghai
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      # ⚠️ MySQL 数据持久化 - 包含所有数据库数据
+      # 删除此卷会导致所有数据库数据丢失！
+      - mysql-data:/var/lib/mysql
+    networks:
+      - 2api-network
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ========================================
+  # Redis 服务 (可选)
+  # 使用方式: docker-compose --profile redis up
+  # ========================================
+  redis:
+    image: redis:7-alpine
+    profiles:
+      - redis
+      - full
+    container_name: 2api-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      # ⚠️ Redis 数据持久化 (AOF 模式)
+      # 删除此卷会导致 Redis 缓存数据丢失
+      - redis-data:/data
+    networks:
+      - 2api-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ========================================
+  # 应用服务 (主服务)
+  # ========================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: 2api-app
+    restart: unless-stopped
+
+    # 使用 env_file 加载环境变量
+    env_file:
+      - .env.docker
+
+    ports:
+      - "${PORT:-40223}:40223"
+
+    volumes:
+      # ========================================
+      # 数据持久化挂载 - 请勿随意修改！
+      # ========================================
+
+      # ⚠️ 重要：应用数据目录 (包含 SQLite 数据库)
+      # - 存储位置: Docker 卷 app-data
+      # - 容器内路径: /app/data
+      # - 包含内容: SQLite 数据库文件 (db.sqlite3)
+      # - 是否必需: 是 (使用 SQLite 时)
+      - app-data:/app/data
+
+      # ⚠️ 重要：日志目录
+      # - 存储位置: Docker 卷 app-logs
+      # - 容器内路径: /app/logs
+      # - 包含内容: 应用运行日志
+      # - 是否必需: 推荐 (便于问题排查)
+      - app-logs:/app/logs
+
+      # 静态文件目录 (只读，可选)
+      # - 如需自定义静态文件，取消下一行注释
+      # - ./static:/app/static:ro
+
+    networks:
+      - 2api-network
+
+    # 依赖服务 (根据配置动态调整)
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:40223/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
