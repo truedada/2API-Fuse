@@ -153,6 +153,11 @@ class ChatService:
         if upstream_model != user_model_name:
             logger.debug(f"执行模型映射: {user_model_name} -> {upstream_model}")
 
+        # 【核心修改】获取该 Adapter 对该模型的自定义后端扣费权重
+        backend_cost = adapter.get_backend_usage_cost(upstream_model)
+        if backend_cost != 1:
+            logger.info(f"[{trace_id}] 模型 {upstream_model} 后端权重: {backend_cost}")
+
         req_dict = request.model_dump(exclude_none=True)
         req_dict['model'] = upstream_model
 
@@ -169,14 +174,16 @@ class ChatService:
             prompt_tokens: int = 0, 
             completion_tokens: int = 0,
             total_tokens: int = 0,
-            is_stream_log: bool = False
+            is_stream_log: bool = False,
+            backend_cost: int = 1 # 【新增】参数
         ):
             # 计算耗时
             duration = int((time.time() - start_time) * 1000)
             
             try:
                 # 1. Redis: 记录渠道使用 (触发限流检查)
-                await CacheService.record_channel_usage(channel_id, model_name)
+                # 【修改】传入 cost 参数
+                await CacheService.record_channel_usage(channel_id, model_name, cost=backend_cost)
                 
                 # 2. Redis: 记录 Token 消耗 (用于计费)
                 if total_tokens > 0:
@@ -224,7 +231,14 @@ class ChatService:
                         if not usage_recorded:
                             usage_recorded = True
                             # 使用 asyncio.create_task 异步记录，不阻塞流
-                            asyncio.create_task(CacheService.record_channel_usage(channel_id, user_model_name))
+                            # 【修改】传入 backend_cost
+                            asyncio.create_task(
+                                CacheService.record_channel_usage(
+                                    channel_id, 
+                                    user_model_name, 
+                                    cost=backend_cost
+                                )
+                            )
 
                         # 尝试解码以在日志中正确显示中文
                         try:
@@ -297,6 +311,7 @@ class ChatService:
                             # 这消除了请求结束时的延迟感
                             
                             # [修改] 调用统一的记录任务，同时写入 Redis 和 DB
+                            # 【修改】传入 backend_cost
                             asyncio.create_task(
                                 record_usage_task(
                                     channel_id=channel_id,
@@ -305,7 +320,8 @@ class ChatService:
                                     prompt_tokens=prompt_tokens_cnt,
                                     completion_tokens=completion_tokens_cnt,
                                     total_tokens=final_total,
-                                    is_stream_log=True
+                                    is_stream_log=True,
+                                    backend_cost=backend_cost
                                 )
                             )
 
@@ -335,6 +351,7 @@ class ChatService:
 
             # 使用 BackgroundTask 记录使用情况
             # [修改] 调用统一任务
+            # 【修改】传入 backend_cost
             background_tasks.add_task(
                 record_usage_task, 
                 channel_id=channel_id, 
@@ -343,7 +360,8 @@ class ChatService:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
-                is_stream_log=False
+                is_stream_log=False,
+                backend_cost=backend_cost
             )
 
             return JSONResponse(content=response_data)

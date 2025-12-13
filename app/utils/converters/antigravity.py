@@ -1,3 +1,4 @@
+# app/utils/converters/antigravity.py
 import uuid
 import json
 import traceback
@@ -44,7 +45,8 @@ class AntigravityConverter(GeminiConverter):
 
         # 4. 处理 Thinking 和 Claude 的兼容性配置
         is_claude = "claude" in internal_model.lower()
-        AntigravityConverter._process_generation_config(gemini_request, is_claude, thinking_mode)
+        # [修复] 传入 internal_model 以便在 _process_generation_config 中判断 Flash 模型
+        AntigravityConverter._process_generation_config(gemini_request, is_claude, thinking_mode, internal_model)
 
         # 5. 如果是 Claude 模型，需要进行更深度的 Tools Schema 清洗
         if is_claude and "tools" in gemini_request:
@@ -87,7 +89,7 @@ class AntigravityConverter(GeminiConverter):
                 return None
 
             raw_data = json.loads(json_str)
-            logger.debug(f"Antigravity 流式Chunk: {raw_data}")
+            #logger.debug(f"Antigravity 流式Chunk: {raw_data}")
             
             # Antigravity 的核心逻辑：解包 "response" 字段
             # 有时候它直接返回 Gemini 格式，有时候包在 response 里
@@ -147,8 +149,15 @@ class AntigravityConverter(GeminiConverter):
         return model_name, "default"
 
     @staticmethod
-    def _process_generation_config(req: Dict, is_claude: bool, thinking_mode: str):
+    def _process_generation_config(req: Dict, is_claude: bool, thinking_mode: str, model_name: str):
         """处理 generationConfig，特别是 Thinking 和 Claude 的冲突"""
+        
+        # [针对 Computer Use 模型的特殊修复]
+        # rev19-uic3-1p (Gemini 2.5 Computer Use) 强制要求 Thinking Budget > 0
+        # 如果用户未指定模式 (default)，则强制升级为 max
+        if "rev19-uic3-1p" in model_name and thinking_mode == "default":
+            thinking_mode = "max"
+
         gen_config = req.setdefault("generationConfig", {})
 
         # 1. 非 Claude 模型移除 maxOutputTokens (Antigravity 可能会报错)
@@ -157,14 +166,22 @@ class AntigravityConverter(GeminiConverter):
 
         # 2. Thinking Budget 设置
         if thinking_mode == "max":
-            gen_config["thinkingConfig"] = {"thinkingBudget": 32768, "includeThoughts": True}
+            # [修复] 适配 Flash 模型限额
+            # Flash 系列模型最大支持 24576，其他 Pro 模型支持 32768
+            if "flash" in model_name.lower():
+                gen_config["thinkingConfig"] = {"thinkingBudget": 24576, "includeThoughts": True}
+            else:
+                gen_config["thinkingConfig"] = {"thinkingBudget": 32768, "includeThoughts": True}
+        
         elif thinking_mode == "standard":
             # 标准思考模式：Claude 默认自带思考，Gemini 需要注入 budget
             gen_config["thinkingConfig"] = {"thinkingBudget": 1024, "includeThoughts": True}
+        
         elif thinking_mode == "none":
             # 显式关闭思考
             if "thinkingConfig" in gen_config:
                 del gen_config["thinkingConfig"]
+        
         elif thinking_mode == "default":
             # 清理不支持的字段 (如 thinkingLevel)
             if "thinkingConfig" in gen_config and "thinkingLevel" in gen_config["thinkingConfig"]:

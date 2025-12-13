@@ -1,4 +1,3 @@
-# app/services/admin.py
 import time
 from datetime import datetime, timezone  # 【修改】引入 timezone
 from typing import List, Tuple, Optional, Any, Dict
@@ -437,7 +436,7 @@ class AdminService:
         
         try:
             # --- 阶段 A: 上游同步 ---
-            # 获取剩余量 { "bucket": { "period": remaining } }
+            # 获取剩余量 { "bucket": { "period": remaining, "_reset_ts": ts } }
             remaining_map = await adapter.fetch_remaining_quota()
             
             if remaining_map:
@@ -459,17 +458,29 @@ class AdminService:
                     if bucket not in db_progress:
                         db_progress[bucket] = {}
                     
+                    # 检查 Adapter 返回的该 bucket 是否包含 reset time metadata
+                    upstream_reset_ts = None
+                    if remaining_map and bucket in remaining_map:
+                        upstream_reset_ts = remaining_map[bucket].get("reset_ts")
+                    
                     for period_str, count in periods.items():
                         # 初始化结构
                         if period_str not in db_progress[bucket]:
                             db_progress[bucket][period_str] = {"count": 0, "last_reset": now_ts}
                         
-                        old_count = db_progress[bucket][period_str].get("count", 0)
+                        entry = db_progress[bucket][period_str]
+                        old_count = entry.get("count", 0)
+                        old_reset = entry.get("last_reset")
                         
                         # 仅当数值变化时更新
                         if count != old_count:
-                            db_progress[bucket][period_str]["count"] = count
-                            # 注意：手动同步不更新 last_reset，那是 Scheduler 重置任务的职责
+                            entry["count"] = count
+                            has_change = True
+
+                        # [新增] 如果上游有明确的 reset time，且与当前不同，则更新 DB
+                        # 这样能让 Scheduler 调度更准确，或者 UI 显示重置时间更准
+                        if upstream_reset_ts and upstream_reset_ts != old_reset:
+                            entry["last_reset"] = upstream_reset_ts
                             has_change = True
                 
                 if has_change:
@@ -478,7 +489,7 @@ class AdminService:
             return {
                 "success": True, 
                 "upstream_data": synced_data, 
-                "msg": "进度同步完成" if synced_data else "上游未返回进度数据，已更新本地缓存状态"
+                "msg": "配额使用进度同步完成" if synced_data else "上游未返回配额使用进度数据，已更新本地缓存状态"
             }
 
         except NotImplementedError:

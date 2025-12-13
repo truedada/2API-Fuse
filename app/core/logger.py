@@ -1,9 +1,10 @@
 import sys
 import os
 import logging
-import inspect  # 引入 inspect 以获取更准确的堆栈信息
+import inspect
 from loguru import logger
 from pathlib import Path
+from app.core.config import settings
 
 # 定义日志文件夹路径
 LOG_PATH = Path("logs")
@@ -13,7 +14,6 @@ if not LOG_PATH.exists():
 class InterceptHandler(logging.Handler):
     """
     用于拦截标准 logging 日志并转发到 Loguru 的处理器
-    (修复了 Python 3.11+ 下显示 logging:callHandlers 的问题)
     """
     def emit(self, record: logging.LogRecord) -> None:
         # 获取对应的 Loguru 日志级别
@@ -22,7 +22,12 @@ class InterceptHandler(logging.Handler):
         except ValueError:
             level = record.levelno
 
-        # --- 核心修复：更健壮的栈帧查找逻辑 ---
+        # --- [新增] 核心修改：日志降级逻辑 ---
+        # 如果是 apscheduler 的 INFO 日志，强制将其视为 DEBUG
+        # 这样它就不会出现在 INFO 级别的控制台输出中，但会保留在 DEBUG 级别的日志文件中
+        if record.name.startswith("apscheduler") and level == "INFO":
+            level = "DEBUG"
+
         # 查找日志调用的源头，跳过 logging 模块自身的栈帧
         frame, depth = inspect.currentframe(), 0
         while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
@@ -35,19 +40,15 @@ class InterceptHandler(logging.Handler):
 
 def setup_logging():
     """
-    统一配置日志：
+    统一配置日志
     """
-    # 1. 拦截标准库日志 (Root Logger)
-    # force=True 确保覆盖之前可能存在的配置
+    # 1. 拦截标准库日志
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
 
-    # 2. 显式开启 http 相关的日志 (关键步骤)
-    # httpx 和 httpcore 默认非常安静，需要手动调低级别才能看到请求细节
-    for log_name in ["httpx", "httpcore"]:
-        log = logging.getLogger(log_name)
-        log.handlers = [InterceptHandler()]
-        log.propagate = False # 防止重复传播
-        log.setLevel(logging.INFO) # 调试网络错误时，建议临时改为 logging.DEBUG
+    # --- [建议] 屏蔽其他常用第三方库的噪音 ---
+    # 如果你不想看 http 请求的详细日志，也可以把 httpx 设为 WARNING
+    # logging.getLogger("httpx").setLevel(logging.WARNING) 
+    # logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     # 3. 移除 loguru 默认的控制台输出
     logger.remove()
@@ -67,15 +68,18 @@ def setup_logging():
         "<level>{message}</level>"
     )
 
+    # 根据配置决定控制台日志级别
+    console_level = "DEBUG" if settings.DEBUG else "INFO"
+
     # 4. 添加控制台输出
     logger.add(
         sys.stderr,
-        level="INFO",
+        level=console_level,
         format=console_log_format,
         colorize=True,
     )
 
-    # 5. 添加全量日志文件
+    # 5. 添加全量日志文件 (包含被降级为 DEBUG 的 apscheduler 日志)
     logger.add(
         LOG_PATH / "all.log",
         level="DEBUG", 
@@ -98,4 +102,4 @@ def setup_logging():
         enqueue=True,
     )
     
-    logger.info("Loguru 配置完成")
+    logger.info(f"Loguru 配置完成，控制台级别: {console_level}")

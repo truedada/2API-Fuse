@@ -23,6 +23,7 @@ class GeminiConverter:
     - 增强的 Tool Call ID 映射与流式 ID 稳定性
     - 原生 Google Search 支持 (通过 web_search 工具触发)
     - 严格的 JSON Schema 转换
+    - [新增] 支持将返回的 inlineData 图片渲染为 Markdown
     """
 
     # Gemini 安全设置：默认全部放开，防止因安全策略导致的拒答
@@ -390,6 +391,20 @@ class GeminiConverter:
                         reasoning_content += part["text"]
                     else:
                         content_str += part["text"]
+                
+                # 3. [新增] Inline Data (Generated Images) -> Markdown
+                if "inlineData" in part:
+                    mime_type = part["inlineData"].get("mimeType", "image/jpeg")
+                    data = part["inlineData"].get("data", "")
+                    
+                    # 构造 Markdown 图片语法
+                    image_markdown = f"\n\n![Generated Image](data:{mime_type};base64,{data})\n\n"
+                    
+                    # 根据 thought 标记决定追加到哪里 (日志显示图片有时会带有 thought=True)
+                    if part.get("thought", False):
+                        reasoning_content += image_markdown
+                    else:
+                        content_str += image_markdown
 
             message = {
                 "role": "assistant",
@@ -407,7 +422,6 @@ class GeminiConverter:
             if grounding_metadata:
                 # OpenAI 没有标准引用字段，这里放在 message 的 extensions 字段或 context 中
                 # 为了兼容性，这里暂不强行修改 content，仅做记录。
-                # 如果需要，可以将引用追加到 content 文本末尾。
                 pass
 
             choices.append({
@@ -498,6 +512,20 @@ class GeminiConverter:
                             reasoning_delta += part["text"]
                         else:
                             content_delta += part["text"]
+                            
+                    # [新增] 处理流式 Inline Data (图片) -> Markdown
+                    if "inlineData" in part:
+                        mime_type = part["inlineData"].get("mimeType", "image/jpeg")
+                        img_b64 = part["inlineData"].get("data", "")
+                        
+                        # 构造 Markdown
+                        img_md = f"\n\n![Generated Image](data:{mime_type};base64,{img_b64})\n\n"
+                        
+                        # 根据 thought 标记决定追加到哪里
+                        if part.get("thought", False):
+                            reasoning_delta += img_md
+                        else:
+                            content_delta += img_md
 
                 if content_delta: delta["content"] = content_delta
                 if reasoning_delta: delta["reasoning_content"] = reasoning_delta

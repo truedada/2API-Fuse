@@ -1,7 +1,8 @@
 import json
 import time
 import httpx
-from typing import Dict, Any, AsyncGenerator, List
+from datetime import datetime
+from typing import Dict, Any, AsyncGenerator, List, Optional
 from loguru import logger
 
 from app.adapters.base import BaseAdapter
@@ -15,6 +16,38 @@ class AntigravityAdapter(BaseAdapter):
     Antigravity 适配器 (Google Cloud Code Internal API Proxy)
     """
     
+    # 定义配额池映射 (参考 Auth Service 逻辑)
+    # 格式: Group Name -> { Limit, Period, Reference Model ID }
+    # 使用 Reference Model ID 在 API 返回的模型列表中查找对应的 Quota Info
+    # 【关键】这里的 Key (如 pool_2_5) 必须与数据库中配置的 "group" 字段完全一致！
+    QUOTA_POOLS = {
+        "pool_2_5": {
+            "limit": 3000, 
+            "period": "18000", 
+            "ref_model": "gemini-2.5-flash" 
+        },
+        "pool_3_0": {
+            "limit": 400, 
+            "period": "18000", 
+            "ref_model": "gemini-3-pro-low"
+        },
+        "pool_computer_use": {
+            "limit": 500, 
+            "period": "18000", 
+            "ref_model": "rev19-uic3-1p"
+        },
+        "pool_claude": {
+            "limit": 250, 
+            "period": "18000", 
+            "ref_model": "claude-sonnet-4-5"
+        },
+        "pool_banana": {
+            "limit": 20, 
+            "period": "18000", 
+            "ref_model": "gemini-3-pro-image"
+        }
+    }
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.auth = AntigravityAuthManager(
@@ -28,9 +61,19 @@ class AntigravityAdapter(BaseAdapter):
         custom = self.config.get("base_url")
         if custom:
             return [custom.rstrip("/")]
-        #return [constants.BASE_URL_DAILY, constants.BASE_URL_PROD]
-        return constants.BASE_URL_PROD
-        # 保留一个得了，麻烦死了
+        return [constants.BASE_URL_DAILY, constants.BASE_URL_PROD]
+
+    def get_backend_usage_cost(self, model_name: str) -> int:
+        """
+        【自定义后端扣费逻辑】
+        
+        由于 Auth Service 中已经根据不同的模型组 (Group) 设定了独立的物理计数器限额
+        (例如: pool_2_5=3000, pool_claude=250)，
+        因此这里每次请求的消耗统一为 1 即可。
+        
+        1 Request = 1 Quota Count
+        """
+        return 1
 
     async def _execute_request(self, payload: Dict, stream: bool) -> httpx.Response:
         """
@@ -75,19 +118,25 @@ class AntigravityAdapter(BaseAdapter):
 
                 # --- 错误处理 ---
                 logger.warning(f"Antigravity 请求失败 [{base_url}] Status: {response.status_code}")
+                
+                # [关键修复] 如果是流式请求但状态码错误，需要主动读取 body 才能知道错误原因
+                if stream:
+                    try:
+                        err_bytes = await response.aread()
+                        err_text = err_bytes.decode('utf-8', errors='ignore')
+                    except Exception:
+                        err_text = "[无法读取流式错误响应体]"
+                else:
+                    err_text = response.text
+
                 await client.aclose()
 
-                # 如果是限流或服务端错误，且还有备用 URL，则重试
-                #if (response.status_code == 429 or response.status_code >= 500) and idx < len(base_urls) - 1:
-                    #continue
-                # 两个url配额通用，没啥用。
-
-                err_text = "" if stream else response.text
                 if response.status_code == 401:
                     raise InvalidCredentials(f"无效的 Token: {err_text}")
                 elif response.status_code == 429:
-                    raise ServiceUnavailable(f"触发限流 ({base_url})")
+                    raise ServiceUnavailable(f"触发限流 ({base_url}) {err_text}")
                 else:
+                    # 这里会把 err_text 抛出来，你就能看到 400 的具体原因了
                     raise ExternalServiceError(f"API Error {response.status_code}: {err_text}")
 
             except httpx.RequestError as e:
@@ -108,7 +157,6 @@ class AntigravityAdapter(BaseAdapter):
         project_id = await self.auth.get_project_id()
         
         # 使用 Converter 生成完整 Payload
-        # 注意：这里的 request_data['model'] 应该是经过平台映射后的真实模型ID（包含 -maxthinking 后缀用于触发功能）
         final_payload = await AntigravityConverter.openai_to_antigravity_payload(request_data, project_id)
 
         response = await self._execute_request(final_payload, stream=False)
@@ -155,11 +203,10 @@ class AntigravityAdapter(BaseAdapter):
             if hasattr(response, "_owner_client"):
                 await response._owner_client.aclose()
 
-    async def fetch_models(self) -> List[str]:
+    async def _fetch_raw_models(self) -> Dict[str, Any]:
         """
-        获取模型列表。
-        直接返回 API 提供的原始模型 ID，去除 IGNORED_MODELS。
-        不再进行别名转换，转换逻辑交由数据库 model_map 配置。
+        内部方法：获取原始模型数据（包含 quotaInfo）
+        用于 fetch_models 和 fetch_remaining_quota 复用
         """
         base_urls = self._get_fallback_base_urls()
         token = await self.auth.get_token()
@@ -178,33 +225,112 @@ class AntigravityAdapter(BaseAdapter):
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        models_data = data.get("models", {})
-                        
-                        # 日志记录配额
-                        self._log_quota_info(models_data)
-
-                        # 返回经过过滤的原始模型 ID
-                        raw_models = list(models_data.keys())
-                        return [m for m in raw_models if m not in constants.IGNORED_MODELS]
+                        return data.get("models", {})
                     else:
                         logger.warning(f"获取模型列表失败: {resp.status_code}")
 
             except Exception as e:
                 logger.error(f"获取模型列表异常 [{base_url}]: {e}")
                 continue
-                
+        return {}
+
+    async def fetch_models(self) -> List[str]:
+        """
+        获取模型列表。
+        直接返回 API 提供的原始模型 ID，去除 IGNORED_MODELS。
+        不再进行别名转换，转换逻辑交由数据库 model_map 配置。
+        """
+        models_data = await self._fetch_raw_models()
+        
+        if models_data:
+            #logger.debug(f"额度: {models_data}")
+            # 日志记录配额
+            #self._log_quota_info(models_data)
+            # 暂时注释，之后要用再说
+
+            # 返回经过过滤的原始模型 ID
+            raw_models = list(models_data.keys())
+            return [m for m in raw_models if m not in constants.IGNORED_MODELS]
+        
         return []
+
+    async def fetch_remaining_quota(self) -> Dict[str, Dict[str, int]]:
+        """
+        获取上游 API 的【剩余额度】。
+        
+        修正逻辑：
+        Google API 返回的是 "resetTime" (窗口结束/下次重置时间)。
+        但系统内部通常将 Redis 中的 timestamp 视为 "last_reset" (窗口开始时间)。
+        为了让系统计算出正确的下次重置时间 (Start + Period)，我们需要在这里将 Google 的时间倒推一个 Period。
+        """
+        models_data = await self._fetch_raw_models()
+        if not models_data:
+            return {}
+        
+        result = {}
+        
+        for pool_name, config in self.QUOTA_POOLS.items():
+            ref_model = config["ref_model"]
+            period_seconds = int(config["period"])  # 确保转为 int
+            
+            # 在 API 返回的模型列表中查找参考模型
+            model_info = models_data.get(ref_model)
+            if not model_info or "quotaInfo" not in model_info:
+                continue
+                
+            quota_info = model_info["quotaInfo"]
+            
+            # 1. 计算剩余次数
+            fraction = quota_info.get("remainingFraction", 1.0)
+            remaining_count = int(config["limit"] * fraction)
+            
+            bucket_data = {
+                config["period"]: remaining_count
+            }
+            
+            # 2. 解析 Reset Time 并转换为 Window Start Time
+            reset_time_str = quota_info.get("resetTime")
+            if reset_time_str:
+                try:
+                    # 解析 Google 返回的 UTC 时间
+                    if reset_time_str.endswith("Z"):
+                        dt_next_reset = datetime.fromisoformat(reset_time_str.replace('Z', '+00:00'))
+                    else:
+                        dt_next_reset = datetime.fromisoformat(reset_time_str)
+                    
+                    if dt_next_reset.tzinfo is None:
+                        dt_next_reset = dt_next_reset.replace(tzinfo=timezone.utc)
+                    
+                    # [关键修复]
+                    # Google Reset Time 是 "未来结束时间"。
+                    # 我们需要存入 Redis 的是 "当前窗口开始时间"。
+                    # Start Time = Next Reset Time - Period
+                    ts_next_reset = int(dt_next_reset.timestamp())
+                    ts_window_start = ts_next_reset - period_seconds
+                    
+                    bucket_data["reset_ts"] = ts_window_start
+                
+                except Exception as e:
+                    logger.warning(f"解析 resetTime 失败 ({reset_time_str}): {e}")
+            
+            result[pool_name] = bucket_data
+            
+        return result
 
     def _log_quota_info(self, models_data: Dict):
         """记录配额信息的辅助方法"""
         log_lines = ["\n[Antigravity Model Quotas]"]
-        log_lines.append(f"{'Model ID':<30} | {'Remaining':<10} | {'Reset Time'}")
-        log_lines.append("-" * 70)
+        log_lines.append(f"{'Model ID':<35} | {'Remaining':<10} | {'Reset Time'}")
+        log_lines.append("-" * 75)
         
         for model_id, info in models_data.items():
+            # 过滤掉不需要关注的内部模型，除非它有显式的 quotaInfo
+            if model_id in constants.IGNORED_MODELS and "quotaInfo" not in info:
+                continue
+                
             quota = info.get("quotaInfo", {})
             remaining = str(quota.get("remainingFraction", "N/A"))
             reset_time = quota.get("resetTime", "N/A")
-            log_lines.append(f"{model_id:<30} | {remaining:<10} | {reset_time}")
+            log_lines.append(f"{model_id:<35} | {remaining:<10} | {reset_time}")
         
         logger.info("\n".join(log_lines))

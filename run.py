@@ -3,11 +3,9 @@ import sys
 import uvicorn
 from app.core.config import settings
 from loguru import logger
-from app.core.logger import setup_logging
+
 def main():
     try:
-
-        setup_logging()
         host = settings.HOST
         port = settings.PORT
         reload_flag = bool(settings.ENVIRONMENT == "dev")

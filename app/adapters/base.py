@@ -39,6 +39,20 @@ class BaseAdapter(abc.ABC):
         if self._credential_update_callback:
             await self._credential_update_callback(new_credentials)
 
+    # -------------------------------------------------------------------------
+    # 【新增】自定义后端扣费逻辑
+    # -------------------------------------------------------------------------
+    def get_backend_usage_cost(self, model_name: str) -> int:
+        """
+        定义该次请求在【后端渠道限流】时消耗的次数权重。
+        默认消耗 1 次。
+        如果某些 Adapter/模型需要扣除更多（例如 Antigravity 扣 4 次），请重写此方法。
+        
+        :param model_name: 传递给 Adapter 的实际模型名 (Internal Model)
+        :return: 消耗的次数 (int)
+        """
+        return 1
+
     @abc.abstractmethod
     async def chat_completion(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """普通对话 (非流式)"""
@@ -91,9 +105,10 @@ class BaseAdapter(abc.ABC):
         示例:
         {
             "gemini-pro": {
-                "86400": 4500  # 对应天级限制，上游说还剩 4500 次
+                "86400": 4500,  # 对应天级限制，上游说还剩 4500 次
                 # 注意：这里没有返回 "60" (RPM)，说明上游没给，或者 Adapter 没解析到。
                 # 系统处理时应忽略 "60" 的规则，不覆盖它。
+                "reset_ts": timestamp (int)  <-- 包含 reset time 用于精确同步
             }
         }
         """

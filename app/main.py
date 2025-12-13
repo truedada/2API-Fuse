@@ -16,7 +16,8 @@ from app.core.scheduler import SchedulerService
 # 假设你有一个汇总的路由文件，或者直接导入 admin 路由
 # 如果你没有 app/api/routers.py，请看代码下方的【补充说明】
 from app.api.routers import api_router
-
+from app.core.logger import setup_logging
+setup_logging()
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     """

@@ -76,15 +76,14 @@ async def seed_data():
             },
             "default_models": [
                 # --- Gemini 2.5 系列 (直接使用 Adapter 支持的 ID) ---
-                "gemini-2.5-pro",
-                "gemini-2.5-pro-maxthinking",
+                #"gemini-2.5-pro",
+                #"gemini-2.5-pro-maxthinking",
                 "gemini-2.5-flash",
                 "gemini-2.5-flash-maxthinking",
                 
                 # --- Gemini 3 系列 (使用上面的 model_map) ---
                 "gemini-3-pro-preview", 
                 "gemini-3-pro-preview-maxthinking",
-                "gemini-3-pro-low",
                 "gemini-3-pro-image-preview",
                 
                 # --- Claude 系列 ---

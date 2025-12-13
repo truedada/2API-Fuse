@@ -267,8 +267,9 @@ class CacheService:
         await client.srem(key, channel_id)
 
     @staticmethod
-    async def record_channel_usage(channel_id: int, model_name: str):
+    async def record_channel_usage(channel_id: int, model_name: str, cost: int = 1):
         ### 核心限流逻辑 (支持分组限流) ###
+        # 【修改】增加 cost 参数，支持自定义后端消耗权重
         client = await get_redis_client()
         info_json = await client.get(CacheKeys.channel_info(channel_id))
         if not info_json: 
@@ -301,17 +302,20 @@ class CacheService:
             return
 
         # Lua 脚本：原子性多周期检查
-        # 脚本逻辑不变，变的只是传入的 key 名称
+        # 【修改】使用 incrby 增加 cost
         script = """
         local pool_key = KEYS[1]
         local channel_id = ARGV[1]
         local rule_count = tonumber(ARGV[2])
+        local cost = tonumber(ARGV[3]) -- 获取 cost
         local is_banned = 0
         
         for i = 1, rule_count do
             local u_key = KEYS[i+1]
-            local limit = tonumber(ARGV[i+2])
-            local curr = redis.call('incr', u_key)
+            local limit = tonumber(ARGV[i+3]) -- limit 索引偏移
+            
+            -- 【核心】使用 incrby 增加自定义的 cost
+            local curr = redis.call('incrby', u_key, cost)
             
             if limit > 0 and curr >= limit then
                 is_banned = 1
@@ -325,17 +329,20 @@ class CacheService:
         """
         
         script_keys = [pool_key] + usage_keys
-        script_args = [channel_id, len(limits)] + limits
+        # 参数顺序: channel_id, rule_count, cost, limit1, limit2...
+        script_args = [channel_id, len(limits), cost] + limits
         
         try:
             is_banned = await client.eval(script, len(script_keys), *script_keys, *script_args)
             if is_banned:
-                logger.warning(f"渠道 {channel_id} 的 {model_name} (或其分组) 达到了使用限制")
+                logger.warning(f"渠道 {channel_id} 的 {model_name} (Cost: {cost}) 达到了使用限制")
             
             # 记录用于 Scheduler 异步持久化的消息
             # 注意：这里我们只记录 model_name，Scheduler 需要自行聚合处理数据库的 usage_progress
             # 或者，如果 Scheduler 也升级了逻辑，可以传递 group 信息。
-            # 为了兼容性，这里暂时只传 model_name，依赖 Scheduler 拉取 Redis 真实计数或根据配置反推。
+            # 为了兼容性，这里暂时只推一条记录，代表“发生了一次调用”
+            # 如果需要记录精确的 cost，这里可以扩展消息格式，比如 "id|model|time|cost"
+            # 这里保持原样，只做限流控制即可，数据库统计稍微有点偏差通常可以接受，或者后续你可扩展消息格式
             msg = f"{channel_id}|{model_name}|{int(time.time())}"
             await client.rpush(CacheKeys.sync_queue_channel(), msg)
             
@@ -602,9 +609,14 @@ class CacheService:
     @staticmethod
     async def apply_upstream_sync(channel_id: int, remaining_map: Dict[str, Dict[str, int]]):
         """
-        【核心同步逻辑】
+        【核心同步逻辑 - 极简修复版】
         根据上游返回的剩余量，结合本地配置的 Limit，反推已用量并覆写 Redis。
-        公式: Used = Config_Limit - Upstream_Remaining
+        
+        核心思想：
+        本地配置是主宰。遍历本地 Channel 的所有配置，根据配置里的 Group 或 Model 名 (Bucket Name)，
+        直接去上游数据里找。找到了就更新，没找到就拉倒。
+        
+        不需要任何自动适配或猜测，完全依赖本地配置。
         """
         if not remaining_map:
             return
@@ -623,52 +635,69 @@ class CacheService:
         pipeline = client.pipeline()
         updated_keys = []
 
-        # 2. 遍历上游返回的数据 (实现“只更新返回了的部分”)
-        for bucket_name, periods_data in remaining_map.items():
-            
-            # 找到对应的规则列表
-            # bucket_name 可能是 model 名，也可能是 group 名
-            # rate_limits 结构通常是: { "gemini-pro": [...], "default": [...] }
-            # 如果配置里用了 group，这里的 bucket_name 应该是 group 名
-            rules = rate_limits.get(bucket_name) or rate_limits.get("default")
-            
+        # 用于去重：因为 rate_limits 是按 Model 存的，多个 Model 可能属于同一个 Group。
+        # 我们只需要为这个 Group 更新一次 Redis 即可。
+        processed_buckets = set()
+
+        # 2. 遍历本地所有的限流规则
+        # rate_limits 结构: { "gemini-2.5-pro": [ { "period": 18000, "count": 3000, "group": "pool_2_5" } ] }
+        for model_key, rules in rate_limits.items():
             if not rules:
                 continue
 
-            for period_str, remaining in periods_data.items():
-                period = int(period_str)
+            for rule in rules:
+                period = rule.get("period")
+                limit = rule.get("count")
+                group = rule.get("group")
                 
-                # 3. 在规则中寻找对应的 Limit
-                target_limit = None
-                for rule in rules:
-                    if rule.get("period") == period:
-                        # 再次校验 group (如果 bucket_name 是 group，这里应该匹配)
-                        rule_group = rule.get("group")
-                        if rule_group and rule_group != bucket_name:
-                            continue
-                        target_limit = rule.get("count")
-                        break
+                # 【核心逻辑】确定 Bucket Name
+                # 既然配置了 Group，那就用 Group 名；没配置就用 Model 名。
+                # 这就是我们在 Redis 里存计数器的 Key。
+                bucket_name = group if group else model_key
                 
-                # 只有找到了本地配置的 limit，才能计算 used
-                if target_limit is not None:
-                    # 【核心计算】 已用 = 总限额 - 剩余
-                    used = target_limit - remaining
-                    
-                    # 边界处理：防止负数 (例如本地配置改小了，但上游还没更新)
-                    if used < 0: used = 0
-                    # 边界处理：防止溢出 (理论上不会，但以防万一)
-                    if used > target_limit: used = target_limit
+                # 唯一标识：避免同 Group 多次处理
+                bucket_ident = f"{bucket_name}:{period}"
+                if bucket_ident in processed_buckets:
+                    continue
 
-                    # 4. 写入 Redis
-                    key = CacheKeys.channel_usage(channel_id, bucket_name, period)
-                    pipeline.set(key, used)
-                    pipeline.expire(key, period) # 续期
+                # 3. 直接去上游返回的数据里找这个 Bucket Name
+                # 无论上游是按 Group 返回的，还是按 Model 返回的，只要和本地配置的 Bucket Name 对得上就行。
+                if bucket_name in remaining_map:
+                    upstream_data = remaining_map[bucket_name]
+                    period_str = str(period)
                     
-                    updated_keys.append(f"{bucket_name}/{period}={used}")
+                    if period_str in upstream_data:
+                        remaining = upstream_data[period_str]
+                        
+                        # 【核心计算】 已用 = 总限额 - 剩余
+                        used = limit - remaining
+                        
+                        # 边界处理：防止负数 (例如本地 Limit 改小了)
+                        if used < 0: 
+                            logger.warning(f"Channel {channel_id} [{bucket_name}] Used<0 (Limit {limit} - Rem {remaining}). 归零.")
+                            used = 0
+                        
+                        # 边界处理：防止溢出
+                        if used > limit: used = limit
+
+                        # 4. 写入 Redis
+                        key = CacheKeys.channel_usage(channel_id, bucket_name, period)
+                        pipeline.set(key, used)
+                        pipeline.expire(key, period) # 续期
+                        
+                        updated_keys.append(f"{bucket_name}/{period}={used}")
+                        
+                        # 标记已处理
+                        processed_buckets.add(bucket_ident)
 
         if updated_keys:
             await pipeline.execute()
-            logger.info(f"Channel {channel_id} 同步完成: {updated_keys}")
+            logger.debug(f"Channel {channel_id} 同步使用限额完成: {updated_keys}")
+        else:
+            # 如果走到这里，说明上游返回的数据 Key，和本地配置算出来的 Bucket Name 没一个对得上的。
+            # 比如本地配置 group="pool_A"，上游返回 key="pool_B"。
+            pass
+    
     @staticmethod
     async def get_current_channel_usage(channel_id: int) -> Dict[str, Dict[str, int]]:
         """
@@ -688,13 +717,11 @@ class CacheService:
         
         # 遍历配置的所有规则，去 Redis 查当前值
         for model_or_group, rules in rate_limits.items():
-            bucket_name = model_or_group # 这里的 key 就是 bucket_name
-            
+            # 这里的 model_or_group 只是 dict 的 key，具体 bucket 要看 rule 里的 group
             for rule in rules:
                 period = rule.get("period")
-                # 如果规则里显式定义了 group，bucket_name 应该优先取 group
-                if rule.get("group"):
-                    bucket_name = rule.get("group")
+                # 【核心逻辑】保持一致：优先取 group，无 group 取 model 名
+                bucket_name = rule.get("group") or model_or_group
                 
                 key = CacheKeys.channel_usage(channel_id, bucket_name, period)
                 val = await client.get(key)

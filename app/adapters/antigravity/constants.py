@@ -23,8 +23,5 @@ IGNORED_MODELS = [
     "chat_20706", 
     "chat_23310", 
     "gemini-2.5-flash-lite",
-    "MODEL_PLACEHOLDER_M12",
-    "MODEL_PLACEHOLDER_M8",
-    "MODEL_PLACEHOLDER_M7",
-    "MODEL_PLACEHOLDER_M9"
+    "gemini-2.5-pro"  # 疑似没有配额
 ]
