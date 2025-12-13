@@ -3,11 +3,10 @@
 import json
 import time
 import httpx
-# jwt 库移除，因为不再支持 Service Account
 from httpx import Proxy
 from typing import Dict, Any, AsyncGenerator, List, Optional
 from loguru import logger
-from app.core.config import settings
+
 from app.adapters.base import BaseAdapter
 from app.utils.converters.gemini import GeminiConverter
 from app.core.exceptions.definitions import (
@@ -16,29 +15,20 @@ from app.core.exceptions.definitions import (
     ServiceUnavailable,
     InvalidCredentials
 )
+# 导入拆分后的模块
+from . import constants
+from .auth_manager import GeminiCliAuthManager
 
 class GeminiCliAdapter(BaseAdapter):
     """
     Google Gemini 适配器 (GeminiCli / Cloud Code 内部接口专用)
     
     仅用于适配 GCLI 获取的凭证 (Scope: cloud-platform)。
-    拼接逻辑：BaseURL + /v1internal + :action
+    核心逻辑：
+    1. 使用 OAuth2 refresh_token 换取 access_token
+    2. 构造 Cloud Code 内部 API 请求 (v1internal)
+    3. 处理特殊的 response 封包格式
     """
-    
-    # 默认域名 (不带 path)
-    DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com"
-    # 固定 API 路径前缀
-    API_PATH_PREFIX = "/v1internal"
-    
-    # 标准 OAuth2 Token 刷新地址
-    GOOGLE_OAUTH2_TOKEN_URL = "https://oauth2.googleapis.com/token"
-    
-    # GCLI 凭证所需的 Scopes
-    SCOPES = [
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -49,128 +39,31 @@ class GeminiCliAdapter(BaseAdapter):
         custom_url = self.config.get("base_url")
         if custom_url:
             self.base_url = custom_url.rstrip("/")
+            logger.debug(f"[GeminiCli] 使用自定义 Base URL: {self.base_url}")
         else:
-            self.base_url = self.DEFAULT_BASE_URL
+            self.base_url = constants.DEFAULT_BASE_URL
+            logger.debug(f"[GeminiCli] 使用默认 Base URL: {self.base_url}")
         
-        # 缓存 Access Token 及其过期时间
-        # 初始化时，尝试从 credentials 中读取已有的 token 和过期时间
-        self._access_token: Optional[str] = self.credentials.get("token") or self.credentials.get("access_token")
+        # 初始化认证管理器 (接管 Token 逻辑)
+        self.auth = GeminiCliAuthManager(
+            credentials=self.credentials,
+            proxy_url=self.proxy_url,
+            save_callback=self.save_credentials
+        )
         
-        # 处理 expiry，确保转为 float/int
-        cred_expiry = self.credentials.get("expiry")
-        self._token_expiry: float = float(cred_expiry) if cred_expiry else 0.0
-        
-        # 凭证解析
-        self.cred_type = self._determine_credential_type()
-         # 打印调试信息，确认代理配置是否生效
+        # 打印调试信息，确认代理配置是否生效
         if self.proxy_url:
-            
             logger.debug(f"[GeminiCli] 初始化完成，已配置代理: {self.proxy_url}")
         else:
             logger.debug("[GeminiCli] 初始化完成，未配置代理。")
-        
-    def _determine_credential_type(self) -> str:
-        """
-        判断凭证类型 (严格匹配，不猜测)
-        """
-        creds = self.credentials
-        if isinstance(creds, dict):
-            # 移除 Service Account 判断
-            # authorized_user 通常包含 refresh_token, client_id, client_secret
-            if "refresh_token" in creds and "client_id" in creds:
-                return "refresh_token"
-            # 移除 API Key 判断
-            # 移除 access_token 判断
-        
-        # 移除 字符串 API Key 判断
-            
-        return "unknown"
 
-    async def _get_access_token(self) -> str:
-        """
-        获取有效的 Access Token，如果过期则刷新并持久化
-        """
-        # 移除 API Key 直接返回逻辑
-
-        now = time.time()
-        
-        # 检查缓存: 如果有 token 且距离过期还有 5 分钟以上，直接使用
-        if self._access_token and now < self._token_expiry - 300:
-            return self._access_token
-
-        # 刷新 Token
-        new_token = None
-        expires_in = 3599
-
-        try:
-            proxy_object = Proxy(self.proxy_url) if self.proxy_url else None
-            async with httpx.AsyncClient(proxy=proxy_object, timeout=30.0, verify=False) as client:
-                # 移除 Service Account 分支
-                # 移除 access_token 分支，只保留 refresh_token
-                if self.cred_type == "refresh_token":
-                    new_token, expires_in = await self._refresh_oauth_token(client)
-                else:
-                    raise InvalidCredentials(f"未知的凭证类型或不支持的模式: {self.cred_type}")
-        except Exception as e:
-            logger.error(f"GeminiAdapter: 获取 Token 失败: {e}")
-            raise InvalidCredentials(f"身份验证失败: {str(e)}")
-
-        if not new_token:
-             raise InvalidCredentials("获取到的 Access Token 为空")
-
-        # 更新内存缓存
-        self._access_token = new_token
-        self._token_expiry = now + expires_in
-        
-        # === [修复] 持久化 Token ===
-        # 调用父类方法，触发 Service 层回调 -> 更新 DB 和 Redis
-        if isinstance(self.credentials, dict):
-            new_creds = self.credentials.copy()
-            new_creds["token"] = new_token
-            new_creds["expiry"] = self._token_expiry
-            # 注意：refresh_token 本身可能不会变，保持原样即可
-            await self.save_credentials(new_creds)
-        
-        return new_token
-
-    # 移除 _refresh_service_account 方法
-
-    async def _refresh_oauth_token(self, client: httpx.AsyncClient) -> tuple[str, int]:
-        """OAuth2 Refresh Token 流程"""
-        creds = self.credentials
-        
-        # GCLI 的 refresh_token 需要配合 client_id 和 client_secret 使用
-        client_id = creds.get("client_id")
-        client_secret = creds.get("client_secret")
-        refresh_token = creds.get("refresh_token")
-
-        if not refresh_token:
-            raise InvalidCredentials("缺少 refresh_token，无法刷新")
-
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token"
-        }
-        
-        resp = await client.post(self.GOOGLE_OAUTH2_TOKEN_URL, data=data)
-        
-        if resp.status_code != 200:
-            logger.error(f"Refresh Token 失败: {resp.text}")
-            raise InvalidCredentials(f"Refresh Token 授权失败 [{resp.status_code}]: {resp.text}")
-            
-        token_data = resp.json()
-        return token_data["access_token"], token_data.get("expires_in", 3600)
-
-    def _get_api_url(self, action: str, stream: bool = False) -> str:
+    def _get_api_url(self, action: str) -> str:
         """
         构造 GCLI 内部接口 URL
-        格式: {base_url}:{action} (不包含 model name)
+        格式: {base_url}{API_PATH_PREFIX}:{action}
+        例如: https://cloudcode-pa.googleapis.com/v1internal:generateContent
         """
-        base = self.base_url.rstrip("/")
-        # streamGenerateContent 或 generateContent
-        return f"{base}:{action}"
+        return f"{self.base_url}{constants.API_PATH_PREFIX}:{action}"
 
     def _wrap_internal_payload(self, model: str, standard_payload: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -179,6 +72,7 @@ class GeminiCliAdapter(BaseAdapter):
         """
         project_id = self.credentials.get("project_id")
         if not project_id:
+            logger.error("[GeminiCli] 凭证中缺少 project_id")
             raise InvalidCredentials("GCLI 模式必须提供 project_id")
 
         # 修复: v1internal 接口通常要求使用原始 model 名称，不带 models/ 前缀。
@@ -186,8 +80,8 @@ class GeminiCliAdapter(BaseAdapter):
         if full_model.startswith("models/"):
             full_model = full_model.replace("models/", "")
             
-        # [新增] 剥离自定义后缀 (-maxthinking, -nothinking)
-        # 确保发送给 Google 内部接口的是干净的原始模型名
+        # [关键] 剥离自定义后缀 (-maxthinking, -nothinking)
+        # 确保发送给 Google 内部接口的是干净的原始模型名，否则会报 404/400
         full_model = full_model.replace("-maxthinking", "").replace("-nothinking", "")
 
         return {
@@ -197,9 +91,11 @@ class GeminiCliAdapter(BaseAdapter):
         }
 
     async def chat_completion(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """非流式对话"""
+        """非流式对话补全"""
         model = request_data.get("model")
-        token = await self._get_access_token()
+        
+        # 获取 Token (AuthManager 会自动处理刷新和过期)
+        token = await self.auth.get_token()
         
         # 1. 使用 Converter 转换基础请求 (包含 Thinking Config 处理)
         gemini_payload = await GeminiConverter.openai_to_gemini_payload(request_data)
@@ -208,13 +104,14 @@ class GeminiCliAdapter(BaseAdapter):
         final_payload = self._wrap_internal_payload(model, gemini_payload)
         
         # 3. 准备 URL 和 Headers
-        url = self._get_api_url("generateContent", stream=False)
+        url = self._get_api_url("generateContent")
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "geminicli-oauth/1.0", # 统一 User-Agent
+            "User-Agent": constants.USER_AGENT, 
             "Authorization": f"Bearer {token}"
         }
         
+        # 合并额外 Header 配置
         if self.extra_config and "headers" in self.extra_config:
             headers.update(self.extra_config["headers"])
 
@@ -222,6 +119,7 @@ class GeminiCliAdapter(BaseAdapter):
         proxy_object = Proxy(self.proxy_url) if self.proxy_url else None
         async with httpx.AsyncClient(proxy=proxy_object, timeout=300.0, verify=False) as client:
             try:
+                # logger.debug(f"[GeminiCli] 发起非流式请求: {url}")
                 response = await client.post(url, json=final_payload, headers=headers)
                 
                 if response.status_code != 200:
@@ -237,26 +135,28 @@ class GeminiCliAdapter(BaseAdapter):
                 return GeminiConverter.gemini_response_to_openai(actual_response, model)
                 
             except httpx.RequestError as e:
-                logger.error(f"Gemini 请求网络错误: {e}")
+                logger.error(f"[GeminiCli] 请求网络错误: {e}")
                 raise ExternalServiceError(f"网络连接失败: {e}")
 
     async def chat_completion_stream(self, request_data: Dict[str, Any]) -> AsyncGenerator[str, None]:
-        """流式对话"""
+        """流式对话补全"""
         model = request_data.get("model")
-        token = await self._get_access_token()
+        # 获取 Token
+        token = await self.auth.get_token()
         
-        # 1. 使用 Converter 转换基础请求 (包含 Thinking Config 处理)
+        # 1. 转换请求
         gemini_payload = await GeminiConverter.openai_to_gemini_payload(request_data)
         
-        # 2. 封装为 GCLI 格式 (这里会剥离后缀)
+        # 2. 封装 Payload
         final_payload = self._wrap_internal_payload(model, gemini_payload)
-        #logger.debug(f"Gemini 流式请求头 {final_payload}")
-        # 3. 准备 URL
-        url = self._get_api_url("streamGenerateContent", stream=True) + "?alt=sse"
+        # logger.debug(f"[GeminiCli] 流式 Payload: {json.dumps(final_payload, ensure_ascii=False)}")
+
+        # 3. 准备 URL (注意添加 ?alt=sse)
+        url = self._get_api_url("streamGenerateContent") + "?alt=sse"
         
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "geminicli-oauth/1.0",
+            "User-Agent": constants.USER_AGENT,
             "Authorization": f"Bearer {token}"
         }
         
@@ -277,7 +177,8 @@ class GeminiCliAdapter(BaseAdapter):
                         except:
                             err_msg = err_text.decode('utf-8', errors='ignore')
 
-                        logger.error(f"Gemini 流式请求失败 [{response.status_code}]: {err_msg}")
+                        logger.error(f"[GeminiCli] 流式请求失败 [{response.status_code}]: {err_msg}")
+                        
                         if response.status_code in [401, 403]:
                             raise PermissionDenied(f"权限错误: {response.status_code} (请检查 Project ID 或 Scope)")
                         elif response.status_code == 429:
@@ -299,9 +200,8 @@ class GeminiCliAdapter(BaseAdapter):
                         try:
                             # 5.1 解析原始 JSON
                             raw_chunk = json.loads(chunk_str)
-                            # 5.2 解包 response 字段 (Internal API 特性)
+                            # 5.2 解包 response 字段
                             # 原始数据可能是: { "response": { "candidates": ... } }
-                            #logger.debug(raw_chunk)
                             actual_chunk = raw_chunk.get("response", raw_chunk)
                             
                             # 5.3 重新构造成 SSE 行字符串，供 Converter 解析
@@ -323,11 +223,11 @@ class GeminiCliAdapter(BaseAdapter):
                     yield "data: [DONE]\n\n"
                     
             except httpx.RequestError as e:
-                logger.error(f"Gemini 流式网络错误: {e}")
+                logger.error(f"[GeminiCli] 流式网络错误: {e}")
                 raise ExternalServiceError(f"流式连接中断: {e}")
 
     def _handle_error(self, response: httpx.Response):
-        """统一错误处理"""
+        """统一错误处理逻辑"""
         try:
             error_data = response.json()
             # GCLI 错误信息可能嵌套在 error 字段中
@@ -335,7 +235,7 @@ class GeminiCliAdapter(BaseAdapter):
         except:
             error_msg = response.text
 
-        logger.error(f"Gemini API Error [{response.status_code}]: {error_msg}")
+        logger.error(f"[GeminiCli] API Error [{response.status_code}]: {error_msg}")
 
         if response.status_code == 400:
             raise ExternalServiceError(f"请求参数错误: {error_msg}")
@@ -355,27 +255,9 @@ class GeminiCliAdapter(BaseAdapter):
     async def validate_credential(self) -> bool:
         """
         验证凭证有效性
-        由于 internal 接口可能不支持列出模型，改为直接尝试刷新 Token。
-        这能确保 Refresh Token 是实时有效的。
+        委托给 AuthManager 处理
         """
-        proxy_object = Proxy(self.proxy_url) if self.proxy_url else None
-        
-        try:
-            # 必须使用 refresh_token 模式，否则无法通过此测试
-            if self.cred_type != "refresh_token":
-                return False
-                
-            async with httpx.AsyncClient(proxy=proxy_object, timeout=10.0, verify=False) as client:
-                # 强制发起刷新请求，不走缓存
-                await self._refresh_oauth_token(client)
-            
-            return True
-            
-        except (InvalidCredentials, PermissionDenied):
-            return False
-        except Exception as e:
-            logger.warning(f"凭证验证过程发生非鉴权类异常: {e}")
-            return False
+        return await self.auth.validate()
 
     async def fetch_models(self) -> List[str]:
         """
