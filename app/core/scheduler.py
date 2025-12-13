@@ -13,7 +13,17 @@ from app.core.redis.cache import CacheService, CacheKeys
 from app.core.redis.connection import get_redis_client
 from app.models.channel import Channel
 from app.models.apikey import ApiKey
+from app.models.platform import Platform
+
+# 【新增】需要 AdapterFactory 来构建适配器，直接与 Adapter 层交互，不经过 Service
+from app.adapters.factory import AdapterFactory
+from app.adapters.base import BaseAdapter
+
+# 引入 Repositories
 from app.repositories.apikey import ApiKeyRepository
+from app.repositories.channel import ChannelRepository
+from app.repositories.platform import PlatformRepository
+from app.repositories.usage_log import UsageLogRepository
 
 class SchedulerService:
     """
@@ -23,6 +33,7 @@ class SchedulerService:
     2. 消费 Redis 队列，将 ApiKey 使用量同步到 MySQL
     3. 扫描数据库，重置已过期的 Channel 配额
     4. 定时重构系统模型列表缓存 (Cache Rebuild)
+    5. [新增] 定时从上游同步渠道配额 (Remote Sync)
     """
     _instance = None
     
@@ -32,7 +43,13 @@ class SchedulerService:
         
         self.scheduler: Optional[AsyncIOScheduler] = None
         self._running = False
+        
+        # 初始化所需的 Repositories
         self.apikey_repo = ApiKeyRepository()
+        self.channel_repo = ChannelRepository()
+        self.platform_repo = PlatformRepository()
+        self.usage_log_repo = UsageLogRepository()
+        
         SchedulerService._instance = self
 
     @classmethod
@@ -62,7 +79,7 @@ class SchedulerService:
         logger.info("开始启动调度器...")
         self.scheduler = self._create_scheduler()
         
-        # 任务1: Channel Usage Sync (高频)
+        # 任务1: Channel Usage Sync (高频: 10秒)
         # 将 Redis 里的渠道调用次数写入数据库
         self.scheduler.add_job(
             func=self._sync_channel_usage_to_db,
@@ -72,7 +89,7 @@ class SchedulerService:
             replace_existing=True
         )
         
-        # 任务2: ApiKey Usage Sync (中频)
+        # 任务2: ApiKey Usage Sync (中频: 60秒)
         # 将 Redis 里的 ApiKey 扣费记录写入数据库
         self.scheduler.add_job(
             func=self._sync_apikey_usage_to_db,
@@ -82,7 +99,7 @@ class SchedulerService:
             replace_existing=True
         )
         
-        # 任务3: Quota Reset (中频)
+        # 任务3: Quota Reset (中频: 60秒)
         # 扫描数据库，重置那些“天/小时”周期结束的渠道，让它们复活
         self.scheduler.add_job(
             func=self._reset_expired_quotas,
@@ -92,14 +109,25 @@ class SchedulerService:
             replace_existing=True
         )
 
-        # 【新增】任务4: System Models Cache Rebuild (低频/兜底)
-        # 定时(每10分钟)全量从数据库计算最新的模型列表并更新到 Redis
-        # 用于处理数据一致性（如删除了某个独家模型账号后，清理缓存）
+        # 任务4: System Models Cache Rebuild (低频: 10分钟)
+        # 定时全量从数据库计算最新的模型列表并更新到 Redis
+        # 用于确保 Redis 中的模型列表与数据库最终一致（解决删除账号后的残留问题）
         self.scheduler.add_job(
             func=CacheService.rebuild_system_models_cache,
             trigger=IntervalTrigger(minutes=10),
             id="job_rebuild_models",
             name="Rebuild System Models Cache",
+            replace_existing=True
+        )
+
+        # 【新增】任务5: Batch Remote Quota Sync (低频: 1小时)
+        # 批量从上游获取剩余额度，更新本地进度
+        # 【修改】频率调整为 hours=1，避免频繁打扰上游
+        self.scheduler.add_job(
+            func=self._batch_sync_remote_quotas,
+            trigger=IntervalTrigger(hours=1),
+            id="job_remote_sync",
+            name="Batch Sync Remote Quotas",
             replace_existing=True
         )
         
@@ -112,6 +140,30 @@ class SchedulerService:
             self.scheduler.shutdown(wait=True)
             self._running = False
             logger.info("调度器停止成功。")
+
+    # -------------------------------------------------------------------------
+    # 辅助逻辑 (复刻自 AdminService，用于独立构造 Adapter)
+    # -------------------------------------------------------------------------
+
+    def _get_adapter(self, platform_data: Platform, channel_data: Channel) -> BaseAdapter:
+        """
+        内部辅助函数：根据平台配置和渠道凭证构建适配器实例
+        (完全复刻 AdminService 逻辑，避免 Service 依赖)
+        """
+        # 构造配置字典
+        config = {
+            "base_url": platform_data.base_url,
+            "type": platform_data.adapter_type,
+            "proxy": platform_data.proxy_url,
+            "credentials": channel_data.credentials,
+            "extra_config": platform_data.extra_config or {}
+        }
+
+        # 根据 adapter_type 返回对应的适配器实例
+        adapter_type = platform_data.adapter_type.lower()
+        
+        adapter = AdapterFactory.get_adapter(adapter_type, config)
+        return adapter
 
     # -------------------------------------------------------------------------
     # 任务逻辑实现
@@ -439,3 +491,153 @@ class SchedulerService:
             logger.error(f"执行 _reset_expired_quotas 时出错: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    # -------------------------------------------------------------------------
+    # 【新增】批量远程配额同步逻辑
+    # -------------------------------------------------------------------------
+
+    async def _perform_channel_sync(self, channel: Channel) -> dict:
+        """
+        [复刻逻辑] 单个渠道的同步核心逻辑
+        完全照搬 AdminService.sync_channel_usage，但不依赖 AdminService
+        """
+        # 1. 构建适配器
+        adapter = self._get_adapter(channel.platform, channel)
+
+        synced_data = {}
+        try:
+            # --- 阶段 A: 上游同步 ---
+            # 获取剩余量 { "bucket": { "period": remaining, "_reset_ts": ts } }
+            remaining_map = await adapter.fetch_remaining_quota()
+            
+            if remaining_map:
+                # 计算 Used = Limit - Remaining，并写入 Redis
+                await CacheService.apply_upstream_sync(channel.id, remaining_map)
+                synced_data = remaining_map
+            
+            # --- 阶段 B: 持久化到数据库 ---
+            # 无论上游是否返回数据，我们将 Redis 中最新的计数（包含刚才同步的和自然累加的）拉回数据库
+            current_redis_usage = await CacheService.get_current_channel_usage(channel.id)
+            
+            if current_redis_usage:
+                # DB 结构: { "bucket": { "period": { "count": X, "last_reset": T } } }
+                db_progress = channel.usage_progress or {}
+                now_ts = int(time.time())
+                has_change = False
+
+                for bucket, periods in current_redis_usage.items():
+                    if bucket not in db_progress:
+                        db_progress[bucket] = {}
+                    
+                    # 检查 Adapter 返回的该 bucket 是否包含 reset time metadata
+                    upstream_reset_ts = None
+                    if remaining_map and bucket in remaining_map:
+                        upstream_reset_ts = remaining_map[bucket].get("reset_ts")
+                    
+                    for period_str, count in periods.items():
+                        # 初始化结构
+                        if period_str not in db_progress[bucket]:
+                            db_progress[bucket][period_str] = {"count": 0, "last_reset": now_ts}
+                        
+                        entry = db_progress[bucket][period_str]
+                        old_count = entry.get("count", 0)
+                        old_reset = entry.get("last_reset")
+                        
+                        # 仅当数值变化时更新
+                        if count != old_count:
+                            entry["count"] = count
+                            has_change = True
+
+                        # [新增] 如果上游有明确的 reset time，且与当前不同，则更新 DB
+                        if upstream_reset_ts and upstream_reset_ts != old_reset:
+                            entry["last_reset"] = upstream_reset_ts
+                            has_change = True
+                
+                if has_change:
+                    await self.channel_repo.update(channel.id, {"usage_progress": db_progress})
+
+            return {
+                "success": True, 
+                "upstream_data": synced_data, 
+                "msg": "配额使用进度同步完成" if synced_data else "上游未返回配额使用进度数据，已更新本地缓存状态"
+            }
+
+        except NotImplementedError:
+             return {"success": False, "msg": "该渠道不支持进度同步"}
+        except Exception as e:
+            # 这里抛出异常由上层捕获
+            raise e
+
+    async def _batch_sync_remote_quotas(self):
+        """
+        定时任务：从上游同步配额
+        策略：
+        1. 使用内部复刻的 _perform_channel_sync 逻辑。
+        2. 仅处理 is_active=True 的渠道。
+        3. 使用 Semaphore 控制并发数，防止打挂服务器。
+        4. 优雅处理不支持同步的渠道 (跳过)。
+        """
+        logger.info("开始执行批量远程配额同步...")
+        
+        try:
+            # 2. 获取所有活跃渠道
+            # 预加载 platform 信息，因为 _perform_channel_sync 内部需要构建 adapter
+            channels = await self.channel_repo.filter(
+                is_active=True,
+                prefetch=["platform"]
+            )
+            
+            if not channels:
+                logger.info("没有活跃渠道需要同步。")
+                return
+
+            # 3. 设置并发信号量 (Max 3)
+            # 【重要】严格控制并发数，同一时刻最多只有 3 个请求发往上游
+            # 防止 "一股脑" 全发出去导致服务器或上游崩溃
+            sem = asyncio.Semaphore(3)
+            
+            sync_count = 0
+            skip_count = 0
+            fail_count = 0
+
+            async def safe_sync_channel(c: Channel):
+                nonlocal sync_count, skip_count, fail_count
+                
+                # 获取锁，限制并发
+                async with sem: 
+                    try:
+                        # [直接调用复刻的内部方法，不依赖 AdminService]
+                        result = await self._perform_channel_sync(c)
+                        
+                        if result.get("success"):
+                            # 如果 msg 包含 "上游未返回"，说明Adapter不支持或没配置相关逻辑，或者上游没返回数据
+                            # 这种不算"失败"，算"跳过/无数据"
+                            if "上游未返回" in result.get("msg", ""):
+                                skip_count += 1
+                            else:
+                                sync_count += 1
+                                logger.debug(f"同步渠道 [{c.name}] 完成: {result.get('msg')}")
+                        else:
+                            # 明确返回 False (例如不支持)
+                            skip_count += 1
+                            
+                    except Exception as e:
+                        # 捕获所有异常，防止单个渠道失败中断整个任务
+                        fail_count += 1
+                        logger.warning(f"同步渠道 [{c.name}] 失败: {e}")
+
+            # 4. 创建任务并执行
+            # 这里虽然创建了所有任务，但因为 Semaphore 的存在，它们会排队执行
+            tasks = [safe_sync_channel(c) for c in channels]
+            
+            start_time = time.time()
+            await asyncio.gather(*tasks)
+            duration = time.time() - start_time
+            
+            logger.info(
+                f"批量同步渠道使用数据结束。耗时: {duration:.2f}s | "
+                f"成功同步: {sync_count} | 跳过/无数据: {skip_count} | 失败: {fail_count}"
+            )
+            
+        except Exception as e:
+             logger.error(f"执行 _batch_sync_remote_quotas 出现未捕获异常: {e}")

@@ -99,7 +99,7 @@ async def delete_platform(
 
 @router.get("/channels", response_model=ListResponse[ChannelResponse], operation_id="list_channels")
 async def list_channels(
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     platform_id: Optional[int] = None,
     service: AdminService = Depends(get_admin_service)
@@ -191,7 +191,7 @@ async def refresh_channel_session(
 
 @router.get("/apikeys", response_model=ListResponse[ApiKeyResponse], operation_id="list_apikeys")
 async def list_apikeys(
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     service: AdminService = Depends(get_admin_service)
 ):
@@ -228,7 +228,7 @@ async def delete_apikey(
 
 @router.get("/logs", response_model=ListResponse[UsageLogResponse], operation_id="list_usage_logs")
 async def list_usage_logs(
-    limit: int = Query(20, ge=1, le=100, description="每页条数"),
+    limit: int = Query(20, ge=1, le=1000, description="每页条数"),
     offset: int = Query(0, ge=0, description="偏移量"),
     keyword: Optional[str] = Query(None, description="搜索模型名或TraceID"),
     api_key_id: Optional[int] = Query(None, description="按API Key ID筛选"),
