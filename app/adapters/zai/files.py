@@ -10,8 +10,7 @@ from loguru import logger
 
 from app.core.exceptions.definitions import ExternalServiceError
 from app.core.redis.connection import get_redis_client
-from app.adapters.zai.constants import BASE_URL
-
+from app.adapters.zai.constants import DEFAULT_BASE_URL
 async def upload_image(base64_str: str, headers: Dict[str, str]) -> Dict[str, Any]:
     """
     上传图片到 Z.ai 或从 Redis 缓存获取
@@ -47,7 +46,7 @@ async def upload_image(base64_str: str, headers: Dict[str, str]) -> Dict[str, An
 
     # 3. 上传图片
     filename = f"pasted_image_{int(time.time()*1000)}.{ext}"
-    upload_url = f"{BASE_URL}/v1/files/"
+    upload_url = f"{DEFAULT_BASE_URL}/v1/files/"
     
     # 构造 multipart/form-data
     files = {

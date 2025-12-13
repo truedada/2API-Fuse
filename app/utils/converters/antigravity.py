@@ -21,37 +21,37 @@ class AntigravityConverter(GeminiConverter):
         # 1. 复用父类方法生成标准的 Gemini Payload
         gemini_request = await GeminiConverter.openai_to_gemini_payload(request_data)
 
-        # 2. 解析模型别名与 Thinking 模式
+        # 2. 解析模型和 Thinking 模式
+        # 获取用户请求的模型名称 (此时已经过 Platform 层映射)
         input_model = request_data.get("model", "")
-        real_model, thinking_mode = AntigravityConverter._parse_thinking_mode(input_model)
-        internal_model = constants.MODEL_ALIAS_MAP.get(real_model, real_model)
+        internal_model, thinking_mode = AntigravityConverter._parse_thinking_mode(input_model)
 
         # 3. 针对 Antigravity 的特殊处理
-        # 3.1 移除 safetySettings (Antigravity 通常不需要显式传递，或者由网关控制)
+        # 移除 safetySettings (Antigravity 通常不需要显式传递，或者由网关控制)
         gemini_request.pop("safetySettings", None)
 
-        # 3.2 强制设置 Tool Config 模式
+        # 3.1 强制设置 Tool Config 模式
         tool_config = gemini_request.setdefault("toolConfig", {})
         fc_config = tool_config.setdefault("functionCallingConfig", {})
         # 如果父类没有设置特定的 mode (如 ANY/NONE)，则默认为 VALIDATED
         if "mode" not in fc_config:
             fc_config["mode"] = "VALIDATED"
 
-        # 3.3 [特殊修正] System Instruction 格式修正
+        # 3.2 [特殊修正] System Instruction 格式修正
         # Antigravity 要求 systemInstruction 必须包含 role: "user"
         if "systemInstruction" in gemini_request:
             gemini_request["systemInstruction"]["role"] = "user"
 
-        # 3.4 处理 Thinking 和 Claude 的兼容性配置
+        # 4. 处理 Thinking 和 Claude 的兼容性配置
         is_claude = "claude" in internal_model.lower()
         AntigravityConverter._process_generation_config(gemini_request, is_claude, thinking_mode)
 
-        # 3.5 如果是 Claude 模型，需要进行更深度的 Tools Schema 清洗
+        # 5. 如果是 Claude 模型，需要进行更深度的 Tools Schema 清洗
         if is_claude and "tools" in gemini_request:
             AntigravityConverter._deep_clean_claude_tools(gemini_request["tools"])
 
-        # 4. 构造 Antigravity 外层封装
-        # Session ID 生成逻辑
+        # 6. 构造 Antigravity 外层封装
+        # Session ID 生成逻辑，用于保持会话一致性
         n = uuid.uuid4().int & (1 << 63) - 1
         gemini_request["sessionId"] = f"-{n}"
 
@@ -88,6 +88,7 @@ class AntigravityConverter(GeminiConverter):
 
             raw_data = json.loads(json_str)
             logger.debug(f"Antigravity 流式Chunk: {raw_data}")
+            
             # Antigravity 的核心逻辑：解包 "response" 字段
             # 有时候它直接返回 Gemini 格式，有时候包在 response 里
             actual_gemini_chunk = raw_data.get("response", raw_data)
@@ -109,29 +110,41 @@ class AntigravityConverter(GeminiConverter):
             return None
 
     # ==========================
-    # Helper Methods (原 PayloadHandler 逻辑)
+    # Helper Methods (辅助方法)
     # ==========================
 
     @staticmethod
-    def _parse_thinking_mode(model_alias: str) -> Tuple[str, str]:
-        """解析模型名称中的 thinking 后缀"""
-        # 模式 1: Max Thinking (32k)
-        if model_alias.endswith("-maxthinking"):
-            return model_alias.replace("-maxthinking", ""), "max"
+    def _parse_thinking_mode(model_name: str) -> Tuple[str, str]:
+        """
+        解析模型名称中的 thinking 后缀。
+        Returns: (real_internal_model_id, thinking_mode)
+        """
+        # 判断是否为 Claude 系列
+        is_claude = "claude" in model_name.lower()
+
+        # 模式 1: Max Thinking (32k Budget)
+        # 这是一个功能性后缀，无论是否为 Claude 都应当剥离，
+        # 因为 Antigravity 不存在 xxx-maxthinking 的真实模型ID。
+        # 剥离后通过 thinkingConfig 注入 32k budget。
+        if model_name.endswith("-maxthinking"):
+            return model_name.replace("-maxthinking", ""), "max"
         
-        # 模式 2: No Thinking (0)
-        if model_alias.endswith("-nothinking"):
-            return model_alias.replace("-nothinking", ""), "none"
+        # 模式 2: No Thinking (0 Budget)
+        if model_name.endswith("-nothinking"):
+            return model_name.replace("-nothinking", ""), "none"
             
-        # 模式 3: Standard Thinking (1k)
-        # 注意：如果 model 本身就是 claude-sonnet-4-5-thinking 这种原生带 thinking 的，
-        # 我们不去除后缀，标记为 standard 模式以触发 config 注入
-        if model_alias.endswith("-thinking"):
-            if model_alias in constants.MODEL_ALIAS_MAP:
-                return model_alias, "standard"
-            return model_alias.replace("-thinking", ""), "standard"
+        # 模式 3: Standard Thinking (1k Budget / Default)
+        if model_name.endswith("-thinking"):
+            if is_claude:
+                # [关键修正] Claude 模型保留 -thinking 后缀
+                # 因为 claude-sonnet-4-5-thinking 是 Antigravity 真实存在的模型 ID
+                # 不应剥离后缀，否则会变成普通版
+                return model_name, "standard"
+            else:
+                # Gemini 等模型，-thinking 通常是功能性后缀，需要剥离
+                return model_name.replace("-thinking", ""), "standard"
             
-        return model_alias, "default"
+        return model_name, "default"
 
     @staticmethod
     def _process_generation_config(req: Dict, is_claude: bool, thinking_mode: str):
@@ -146,17 +159,19 @@ class AntigravityConverter(GeminiConverter):
         if thinking_mode == "max":
             gen_config["thinkingConfig"] = {"thinkingBudget": 32768, "includeThoughts": True}
         elif thinking_mode == "standard":
+            # 标准思考模式：Claude 默认自带思考，Gemini 需要注入 budget
             gen_config["thinkingConfig"] = {"thinkingBudget": 1024, "includeThoughts": True}
         elif thinking_mode == "none":
+            # 显式关闭思考
             if "thinkingConfig" in gen_config:
                 del gen_config["thinkingConfig"]
         elif thinking_mode == "default":
-            # 清理不支持的字段
+            # 清理不支持的字段 (如 thinkingLevel)
             if "thinkingConfig" in gen_config and "thinkingLevel" in gen_config["thinkingConfig"]:
                 del gen_config["thinkingConfig"]["thinkingLevel"]
 
-        # 3. Claude 兼容性修复
-        # Claude 在开启思考时，严禁传递 topP 和 topK
+        # 3. Claude 兼容性修复 
+        # Claude 在开启思考时，严禁传递 topP 和 topK，否则 API 报错
         is_thinking_enabled = (
             thinking_mode in ["max", "standard"] or 
             (thinking_mode == "default" and gen_config.get("thinkingConfig", {}).get("includeThoughts"))
@@ -182,7 +197,7 @@ class AntigravityConverter(GeminiConverter):
         if not isinstance(schema, dict):
             return
 
-        # Antigravity/Claude 黑名单
+        # Antigravity/Claude Schema 黑名单
         blacklist = [
             "$schema", "maxItems", "minItems", "minLength", "maxLength",
             "exclusiveMinimum", "exclusiveMaximum", "$ref", "$defs",
@@ -193,7 +208,7 @@ class AntigravityConverter(GeminiConverter):
 
         # 处理 anyOf (Claude 偏好单一结构)
         if schema.get("anyOf") and isinstance(schema["anyOf"], list):
-            # 取第一个非 null 的定义
+            # 取第一个非 null 的定义，简化结构
             first_valid = next((x for x in schema["anyOf"] if x.get("type") != "null"), schema["anyOf"][0])
             del schema["anyOf"]
             schema.update(first_valid)

@@ -22,11 +22,14 @@ class GeminiCliAdapter(BaseAdapter):
     Google Gemini 适配器 (GeminiCli / Cloud Code 内部接口专用)
     
     仅用于适配 GCLI 获取的凭证 (Scope: cloud-platform)。
-    强制使用 cloudcode-pa.googleapis.com/v1internal 端点。
+    拼接逻辑：BaseURL + /v1internal + :action
     """
     
-    # 强制指定 Base URL
-    DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com/v1internal"
+    # 默认域名 (不带 path)
+    DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com"
+    # 固定 API 路径前缀
+    API_PATH_PREFIX = "/v1internal"
+    
     # 标准 OAuth2 Token 刷新地址
     GOOGLE_OAUTH2_TOKEN_URL = "https://oauth2.googleapis.com/token"
     
@@ -40,8 +43,14 @@ class GeminiCliAdapter(BaseAdapter):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         
-        # 强制覆盖 base_url，防止配置错误导致 403
-        self.base_url = self.DEFAULT_BASE_URL
+        # === Base URL 优先级处理 ===
+        # 1. 如果配置了 base_url，直接使用 (假设用户配置的是域名/代理根地址)
+        # 2. 如果没配置，使用默认的 cloudcode-pa 域名
+        custom_url = self.config.get("base_url")
+        if custom_url:
+            self.base_url = custom_url.rstrip("/")
+        else:
+            self.base_url = self.DEFAULT_BASE_URL
         
         # 缓存 Access Token 及其过期时间
         # 初始化时，尝试从 credentials 中读取已有的 token 和过期时间

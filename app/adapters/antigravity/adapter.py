@@ -5,7 +5,6 @@ from typing import Dict, Any, AsyncGenerator, List
 from loguru import logger
 
 from app.adapters.base import BaseAdapter
-# 引入新的 Converter
 from app.utils.converters.antigravity import AntigravityConverter
 from app.core.exceptions.definitions import ExternalServiceError, ServiceUnavailable, InvalidCredentials
 from . import constants
@@ -25,10 +24,13 @@ class AntigravityAdapter(BaseAdapter):
         )
 
     def _get_fallback_base_urls(self) -> List[str]:
+        """获取 Base URL 列表，优先使用 Config 配置，否则使用默认回退列表"""
         custom = self.config.get("base_url")
         if custom:
             return [custom.rstrip("/")]
-        return [constants.BASE_URL_DAILY, constants.BASE_URL_PROD]
+        #return [constants.BASE_URL_DAILY, constants.BASE_URL_PROD]
+        return constants.BASE_URL_PROD
+        # 保留一个得了，麻烦死了
 
     async def _execute_request(self, payload: Dict, stream: bool) -> httpx.Response:
         """
@@ -75,8 +77,10 @@ class AntigravityAdapter(BaseAdapter):
                 logger.warning(f"Antigravity 请求失败 [{base_url}] Status: {response.status_code}")
                 await client.aclose()
 
-                if (response.status_code == 429 or response.status_code >= 500) and idx < len(base_urls) - 1:
-                    continue
+                # 如果是限流或服务端错误，且还有备用 URL，则重试
+                #if (response.status_code == 429 or response.status_code >= 500) and idx < len(base_urls) - 1:
+                    #continue
+                # 两个url配额通用，没啥用。
 
                 err_text = "" if stream else response.text
                 if response.status_code == 401:
@@ -100,10 +104,11 @@ class AntigravityAdapter(BaseAdapter):
         raise ExternalServiceError("所有 Base URL 重试均失败")
 
     async def chat_completion(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """非流式"""
+        """非流式对话补全"""
         project_id = await self.auth.get_project_id()
         
         # 使用 Converter 生成完整 Payload
+        # 注意：这里的 request_data['model'] 应该是经过平台映射后的真实模型ID（包含 -maxthinking 后缀用于触发功能）
         final_payload = await AntigravityConverter.openai_to_antigravity_payload(request_data, project_id)
 
         response = await self._execute_request(final_payload, stream=False)
@@ -119,7 +124,7 @@ class AntigravityAdapter(BaseAdapter):
             raise ExternalServiceError("Antigravity 响应非 JSON")
 
     async def chat_completion_stream(self, request_data: Dict[str, Any]) -> AsyncGenerator[str, None]:
-        """流式"""
+        """流式对话补全"""
         project_id = await self.auth.get_project_id()
         
         # 使用 Converter 生成完整 Payload
@@ -151,7 +156,11 @@ class AntigravityAdapter(BaseAdapter):
                 await response._owner_client.aclose()
 
     async def fetch_models(self) -> List[str]:
-        """获取模型列表"""
+        """
+        获取模型列表。
+        直接返回 API 提供的原始模型 ID，去除 IGNORED_MODELS。
+        不再进行别名转换，转换逻辑交由数据库 model_map 配置。
+        """
         base_urls = self._get_fallback_base_urls()
         token = await self.auth.get_token()
         proxy = httpx.Proxy(self.proxy_url) if self.proxy_url else None
@@ -171,14 +180,12 @@ class AntigravityAdapter(BaseAdapter):
                         data = resp.json()
                         models_data = data.get("models", {})
                         
-                        # 日志记录配额 (逻辑保持不变)
+                        # 日志记录配额
                         self._log_quota_info(models_data)
 
-                        # 这里简单的别名生成逻辑可以保留，或者也可以移入 Converter
-                        # 为了 Adapter 的简洁，保留在此处或移入 Converter 的 helper 都可以
-                        # 鉴于 Converter 已经持有 MODEL_ALIAS_MAP，我们简单处理：
+                        # 返回经过过滤的原始模型 ID
                         raw_models = list(models_data.keys())
-                        return self._generate_model_list(raw_models)
+                        return [m for m in raw_models if m not in constants.IGNORED_MODELS]
                     else:
                         logger.warning(f"获取模型列表失败: {resp.status_code}")
 
@@ -201,20 +208,3 @@ class AntigravityAdapter(BaseAdapter):
             log_lines.append(f"{model_id:<30} | {remaining:<10} | {reset_time}")
         
         logger.info("\n".join(log_lines))
-
-    def _generate_model_list(self, raw_models: List[str]) -> List[str]:
-        """生成模型列表别名"""
-        aliases = []
-        reverse_map = {v: k for k, v in constants.MODEL_ALIAS_MAP.items()}
-        
-        for name in raw_models:
-            if name in constants.IGNORED_MODELS:
-                continue
-            
-            base_alias = reverse_map.get(name, name)
-            aliases.append(base_alias)
-            
-            if "gemini" in base_alias.lower() and "thinking" not in base_alias.lower():
-                 aliases.append(f"{base_alias}-maxthinking")
-                 
-        return aliases

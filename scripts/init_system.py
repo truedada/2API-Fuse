@@ -35,7 +35,7 @@ async def seed_data():
         {
             "name": "GeminiCli",
             "adapter_type": "geminicli",
-            "base_url": "https://cloudcode-pa.googleapis.com/v1internal",
+            "base_url": "https://cloudcode-pa.googleapis.com",
             "default_models": [
                 "gemini-2.5-pro",
                 "gemini-2.5-pro-maxthinking",
@@ -48,38 +48,59 @@ async def seed_data():
         {
             "name": "Antigravity",
             "adapter_type": "antigravity",
-            "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com", 
-            "default_models": [
+            "base_url": "https://cloudcode-pa.googleapis.com", 
+            # 关键：在这里配置模型映射
+            # 格式： "用户可见模型名(User Model)": "传递给Adapter的模型名(Internal Model)"
+            "model_map": {
+                # --- Gemini 3.0 系列 ---
+                # 将 preview 映射到 high (Antigravity 内部ID)，并支持 maxthinking
+                "gemini-3-pro-preview": "gemini-3-pro-high",
+                "gemini-3-pro-preview-maxthinking": "gemini-3-pro-high-maxthinking",
+                
+                # Image 模型映射 (生图模型)
+                "gemini-3-pro-image-preview": "gemini-3-pro-image",
+                
                 # --- Gemini 2.5 系列 ---
+                # Computer use (计算机操作) 专用模型映射
+                "gemini-2.5-computer-use-preview": "rev19-uic3-1p",
+                
+                # --- Claude 系列 (重要) ---
+                # 必须显式映射 Thinking 版本，否则可能会被网关拦截或识别错误
+                "claude-sonnet-4-5": "claude-sonnet-4-5", 
+                "claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking", 
+                "claude-opus-4-5-thinking": "claude-opus-4-5-thinking",
+                
+                # --- GPT 系列 ---
+                # 实事求是，OSS 模型直接显示为 OSS，不搞虚假映射
+                "gpt-oss-120b": "gpt-oss-120b-medium"
+            },
+            "default_models": [
+                # --- Gemini 2.5 系列 (直接使用 Adapter 支持的 ID) ---
                 "gemini-2.5-pro",
                 "gemini-2.5-pro-maxthinking",
-                # "gemini-2.5-pro-nothinking", # 可选，通常 default 就够了
-                
                 "gemini-2.5-flash",
                 "gemini-2.5-flash-maxthinking",
                 
-                # --- Gemini 3 系列 ---
-                "gemini-3-pro-preview",       # 对应 High
+                # --- Gemini 3 系列 (使用上面的 model_map) ---
+                "gemini-3-pro-preview", 
                 "gemini-3-pro-preview-maxthinking",
-                
-                "gemini-3-pro-low",           # [新增] 速度快
-                
-                "gemini-3-pro-image-preview", # [新增] 图像生成
+                "gemini-3-pro-low",
+                "gemini-3-pro-image-preview",
                 
                 # --- Claude 系列 ---
                 "claude-sonnet-4-5",
                 "claude-sonnet-4-5-thinking",
-                "claude-opus-4-5-thinking",   # [新增] 强力思考模型
+                "claude-opus-4-5-thinking",
                 
                 # --- GPT 系列 ---
-                "gpt-oss-120b"                 # [新增] 对应 constants.py 里的映射
+                "gpt-oss-120b"
             ]
         }
     ]
 
     for p_data in platforms:
         # 使用 update_or_create 防止重复运行脚本报错
-        # 注意：这里会更新已存在平台的 default_models，确保新模型能被加上
+        # 注意：这里会更新已存在平台的 default_models 和 model_map
         await Platform.update_or_create(
             name=p_data["name"],
             defaults=p_data

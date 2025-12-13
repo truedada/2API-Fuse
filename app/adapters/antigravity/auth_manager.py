@@ -1,5 +1,6 @@
 # app/adapters/antigravity/auth_manager.py
 
+import json
 import time
 import httpx
 from typing import Dict, Optional, Callable, Awaitable
@@ -69,19 +70,20 @@ class AntigravityAuthManager:
                 raise ExternalServiceError(f"Token 刷新网络错误: {e}")
 
     async def _fetch_remote_project_id(self, token: str) -> str:
-        url = f"{constants.BASE_URL_DAILY}{constants.PATH_LOAD_CODE_ASSIST}"
+        url = f"{constants.BASE_URL_PROD}{constants.PATH_LOAD_CODE_ASSIST}"
         headers = {
             "Authorization": f"Bearer {token}",
             "User-Agent": constants.USER_AGENT,
             "Content-Type": "application/json",
-            "Host": "daily-cloudcode-pa.sandbox.googleapis.com"
+            #"Host": "daily-cloudcode-pa.sandbox.googleapis.com"
         }
         
-        logger.info("Antigravity: Fetching real Project ID...")
+        logger.debug("Antigravity: 拉取项目ID...")
         proxy = httpx.Proxy(self.proxy_url) if self.proxy_url else None
 
         async with httpx.AsyncClient(proxy=proxy, timeout=15.0, verify=False) as client:
             resp = await client.post(url, json={"metadata": {"ideType": "ANTIGRAVITY"}}, headers=headers)
+            logger.debug(f"获取反重力资格返回: {resp.json()}")
             if resp.status_code != 200:
                 raise ExternalServiceError(f"获取 Project ID 失败: {resp.text}")
 

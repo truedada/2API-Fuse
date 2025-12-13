@@ -17,25 +17,8 @@ GOOGLE_OAUTH2_TOKEN_URL = "https://oauth2.googleapis.com/token"
 # User Agent
 USER_AGENT = "antigravity/1.11.9 windows/amd64"
 
-# Model Mappings
-MODEL_ALIAS_MAP = {
-    # 功能性映射
-    "gemini-2.5-computer-use-preview": "rev19-uic3-1p",
-    "gemini-3-pro-image-preview": "gemini-3-pro-image",
-    
-    # 核心模型别名整理
-    "gemini-3-pro-preview": "gemini-3-pro-high", 
-    
-    # Claude 系列
-    "claude-sonnet-4-5": "claude-sonnet-4-5",
-    "claude-sonnet-4-5-thinking": "claude-sonnet-4-5-thinking",
-    "claude-opus-4-5-thinking": "claude-opus-4-5-thinking",
-    
-    # GPT 系列
-    "gpt-oss-120b": "gpt-oss-120b-medium"
-}
-
 # Ignore List
+# 这些是内部产生的无效模型ID或占位符，fetch_models 时应当过滤
 IGNORED_MODELS = [
     "chat_20706", 
     "chat_23310", 

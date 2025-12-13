@@ -11,7 +11,7 @@ from app.core.exceptions.definitions import ExternalServiceError
 from app.adapters.base import BaseAdapter
 from app.adapters.zai.sign import generate_zai_signature
 
-from app.adapters.zai.constants import X_FE_VERSION, BASE_URL
+from app.adapters.zai.constants import X_FE_VERSION, DEFAULT_BASE_URL
 from app.adapters.zai.utils import (
     get_time_variables,
     sanitize_reasoning,
@@ -29,7 +29,11 @@ class ZaiAdapter(BaseAdapter):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.base_url = BASE_URL
+        custom_url = self.config.get("base_url")
+        if custom_url:
+            self.base_url = custom_url.rstrip("/")
+        else:
+            self.base_url = DEFAULT_BASE_URL
         self.token = self.credentials.get("token") or self.credentials.get("api_key")
         self.user_id = self.credentials.get("user_id")
         
