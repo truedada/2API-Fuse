@@ -411,3 +411,73 @@ class AdminService:
             result.append(item)
 
         return result, total
+
+    async def sync_channel_usage(self, channel_id: int) -> dict:
+        """
+        同步渠道的使用进度 (Rate Limit Usage)
+        逻辑：Adapter(获取剩余) -> CacheService(反推已用并覆盖Redis) -> DB(持久化)
+        """
+        # 1. 获取完整数据
+        channel = await self.channel_repo.get_with_platform(channel_id)
+        if not channel:
+            raise NotFound(detail="账号不存在")
+        
+        # 如果账号未启用，通常无法请求上游，或者没有同步的必要
+        if not channel.is_active:
+             raise InvalidInput(detail="账号未启用，无法同步进度")
+
+        # 2. 构建适配器
+        adapter = self._get_adapter(channel.platform, channel)
+
+        synced_data = {}
+        
+        try:
+            # --- 阶段 A: 上游同步 ---
+            # 获取剩余量 { "bucket": { "period": remaining } }
+            remaining_map = await adapter.fetch_remaining_quota()
+            
+            if remaining_map:
+                # 计算 Used = Limit - Remaining，并写入 Redis
+                await CacheService.apply_upstream_sync(channel.id, remaining_map)
+                synced_data = remaining_map
+            
+            # --- 阶段 B: 持久化到数据库 ---
+            # 无论上游是否返回数据，我们将 Redis 中最新的计数（包含刚才同步的和自然累加的）拉回数据库
+            current_redis_usage = await CacheService.get_current_channel_usage(channel.id)
+            
+            if current_redis_usage:
+                # DB 结构: { "bucket": { "period": { "count": X, "last_reset": T } } }
+                db_progress = channel.usage_progress or {}
+                now_ts = int(time.time())
+                has_change = False
+
+                for bucket, periods in current_redis_usage.items():
+                    if bucket not in db_progress:
+                        db_progress[bucket] = {}
+                    
+                    for period_str, count in periods.items():
+                        # 初始化结构
+                        if period_str not in db_progress[bucket]:
+                            db_progress[bucket][period_str] = {"count": 0, "last_reset": now_ts}
+                        
+                        old_count = db_progress[bucket][period_str].get("count", 0)
+                        
+                        # 仅当数值变化时更新
+                        if count != old_count:
+                            db_progress[bucket][period_str]["count"] = count
+                            # 注意：手动同步不更新 last_reset，那是 Scheduler 重置任务的职责
+                            has_change = True
+                
+                if has_change:
+                    await self.channel_repo.update(channel.id, {"usage_progress": db_progress})
+
+            return {
+                "success": True, 
+                "upstream_data": synced_data, 
+                "msg": "进度同步完成" if synced_data else "上游未返回进度数据，已更新本地缓存状态"
+            }
+
+        except NotImplementedError:
+             return {"success": False, "msg": "该渠道不支持进度同步"}
+        except Exception as e:
+            raise ExternalServiceError(detail=f"同步进度失败: {str(e)}")

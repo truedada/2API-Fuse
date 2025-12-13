@@ -20,9 +20,9 @@ class GeminiConverter:
     - 支持 多模态 (图片 URL 自动转 Base64)
     - 严格的错误处理和日志记录
     - 支持通过模型后缀 (-maxthinking, -nothinking) 自动控制思考预算
-    - [增强] 增强的 Tool Call ID 映射与流式 ID 稳定性
-    - [增强] 原生 Google Search 支持 (通过 web_search 工具触发)
-    - [增强] 严格的 JSON Schema 转换 (兼容 Node.js SDK 逻辑)
+    - 增强的 Tool Call ID 映射与流式 ID 稳定性
+    - 原生 Google Search 支持 (通过 web_search 工具触发)
+    - 严格的 JSON Schema 转换
     """
 
     # Gemini 安全设置：默认全部放开，防止因安全策略导致的拒答
@@ -304,7 +304,7 @@ class GeminiConverter:
             payload["systemInstruction"] = {"parts": [{"text": "\n".join(system_instructions)}]}
 
         # 3. 处理 Tools 定义 (包含 Function Calling 和 Web Search)
-        # [修改] 参考 Node.js 逻辑，分离常规工具和 Google Search 工具
+        # 分离常规工具和 Google Search 工具
         tools_list = request_dict.get("tools")
         if tools_list:
             gemini_tools_payload = []
@@ -616,7 +616,7 @@ class GeminiConverter:
     @staticmethod
     def _process_json_schema(schema: Dict) -> Dict:
         """
-        [新增] 深度清洗并转换 JSON Schema 以适配 Gemini (参考 Node.js SDK 逻辑)
+        深度清洗并转换 JSON Schema 以适配 Gemini
         1. 处理 type: ["string", "null"] -> nullable: true
         2. 将类型转换为大写 (string -> STRING)
         3. 处理 anyOf 中包含 null 的情况

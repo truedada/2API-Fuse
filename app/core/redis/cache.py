@@ -567,7 +567,7 @@ class CacheService:
         pipeline.set(CacheKeys.sys_models_json(), json_str, ex=3600)
         
         await pipeline.execute()
-        logger.info(f"全量重构模型列表完成，耗时 {time.time() - start_time:.2f}s，共 {len(model_list)} 个模型")
+        logger.debug(f"全量重构模型列表完成，耗时 {time.time() - start_time:.2f}s，共 {len(model_list)} 个模型")
         return model_list
 
     @staticmethod
@@ -598,3 +598,110 @@ class CacheService:
         # 3. 实在没有（冷启动），触发全量构建
         logger.info("模型缓存全量重构中...")
         return await CacheService.rebuild_system_models_cache()
+    
+    @staticmethod
+    async def apply_upstream_sync(channel_id: int, remaining_map: Dict[str, Dict[str, int]]):
+        """
+        【核心同步逻辑】
+        根据上游返回的剩余量，结合本地配置的 Limit，反推已用量并覆写 Redis。
+        公式: Used = Config_Limit - Upstream_Remaining
+        """
+        if not remaining_map:
+            return
+
+        client = await get_redis_client()
+        
+        # 1. 获取渠道配置 (为了拿到 Limit)
+        info_json = await client.get(CacheKeys.channel_info(channel_id))
+        if not info_json:
+            logger.warning(f"同步失败: 找不到 Channel {channel_id} 的缓存配置")
+            return
+            
+        channel_info = json.loads(info_json)
+        rate_limits = channel_info.get("rate_limits", {})
+        
+        pipeline = client.pipeline()
+        updated_keys = []
+
+        # 2. 遍历上游返回的数据 (实现“只更新返回了的部分”)
+        for bucket_name, periods_data in remaining_map.items():
+            
+            # 找到对应的规则列表
+            # bucket_name 可能是 model 名，也可能是 group 名
+            # rate_limits 结构通常是: { "gemini-pro": [...], "default": [...] }
+            # 如果配置里用了 group，这里的 bucket_name 应该是 group 名
+            rules = rate_limits.get(bucket_name) or rate_limits.get("default")
+            
+            if not rules:
+                continue
+
+            for period_str, remaining in periods_data.items():
+                period = int(period_str)
+                
+                # 3. 在规则中寻找对应的 Limit
+                target_limit = None
+                for rule in rules:
+                    if rule.get("period") == period:
+                        # 再次校验 group (如果 bucket_name 是 group，这里应该匹配)
+                        rule_group = rule.get("group")
+                        if rule_group and rule_group != bucket_name:
+                            continue
+                        target_limit = rule.get("count")
+                        break
+                
+                # 只有找到了本地配置的 limit，才能计算 used
+                if target_limit is not None:
+                    # 【核心计算】 已用 = 总限额 - 剩余
+                    used = target_limit - remaining
+                    
+                    # 边界处理：防止负数 (例如本地配置改小了，但上游还没更新)
+                    if used < 0: used = 0
+                    # 边界处理：防止溢出 (理论上不会，但以防万一)
+                    if used > target_limit: used = target_limit
+
+                    # 4. 写入 Redis
+                    key = CacheKeys.channel_usage(channel_id, bucket_name, period)
+                    pipeline.set(key, used)
+                    pipeline.expire(key, period) # 续期
+                    
+                    updated_keys.append(f"{bucket_name}/{period}={used}")
+
+        if updated_keys:
+            await pipeline.execute()
+            logger.info(f"Channel {channel_id} 同步完成: {updated_keys}")
+    @staticmethod
+    async def get_current_channel_usage(channel_id: int) -> Dict[str, Dict[str, int]]:
+        """
+        【新增】辅助方法：从 Redis 读取该渠道当前的所有使用量。
+        用于 Service 层将 Redis 数据持久化回数据库。
+        """
+        client = await get_redis_client()
+        info_json = await client.get(CacheKeys.channel_info(channel_id))
+        if not info_json:
+            return {}
+
+        channel_info = json.loads(info_json)
+        rate_limits = channel_info.get("rate_limits", {})
+        
+        # 结果容器: { "bucket": { "period": count } }
+        result = {}
+        
+        # 遍历配置的所有规则，去 Redis 查当前值
+        for model_or_group, rules in rate_limits.items():
+            bucket_name = model_or_group # 这里的 key 就是 bucket_name
+            
+            for rule in rules:
+                period = rule.get("period")
+                # 如果规则里显式定义了 group，bucket_name 应该优先取 group
+                if rule.get("group"):
+                    bucket_name = rule.get("group")
+                
+                key = CacheKeys.channel_usage(channel_id, bucket_name, period)
+                val = await client.get(key)
+                
+                if val is not None:
+                    if bucket_name not in result:
+                        result[bucket_name] = {}
+                    result[bucket_name][str(period)] = int(val)
+                    
+        return result

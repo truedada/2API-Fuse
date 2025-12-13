@@ -265,7 +265,7 @@ class ChatService:
                 except Exception as e:
                     has_error = True
                     error_msg = str(e)
-                    logger.error(f"[{trace_id}] 流式传输过程中发生错误: {error_msg}")
+                    logger.exception(f"[{trace_id}] 流式传输过程中发生错误: {error_msg}")
 
                     # --- 触发错误计数与熔断 ---
                     # 传入 user_model_name，确保从对应的 Redis 池中移除

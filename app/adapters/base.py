@@ -81,7 +81,24 @@ class BaseAdapter(abc.ABC):
         }
         """
         raise NotImplementedError("该适配器不支持查询余额")
-
+    
+    async def fetch_remaining_quota(self) -> Dict[str, Dict[str, int]]:
+        """
+        获取上游 API 的【剩余额度】(Remaining Quota)。
+        
+        返回格式: { "bucket_name": { "period_str": remaining_count } }
+        
+        示例:
+        {
+            "gemini-pro": {
+                "86400": 4500  # 对应天级限制，上游说还剩 4500 次
+                # 注意：这里没有返回 "60" (RPM)，说明上游没给，或者 Adapter 没解析到。
+                # 系统处理时应忽略 "60" 的规则，不覆盖它。
+            }
+        }
+        """
+        return {}
+        
     async def refresh_session(self) -> Dict[str, Any]:
         """
         刷新会话/Token (针对 Web 逆向或需要定期换 Token 的渠道)。

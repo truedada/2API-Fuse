@@ -29,7 +29,7 @@ async def seed_data():
                 "GLM-4.6V" : "glm-4.6v",
                 "GLM-4.5" : "0727-360B-API",
                 "GLM-4.5-Air" : "0727-106B-API"
-                },
+            },
             "default_models" : ["GLM-4.6" ,"GLM-4.6V" ,"GLM-4.5","GLM-4.5-Air"]
         },
         {
@@ -37,26 +37,54 @@ async def seed_data():
             "adapter_type": "geminicli",
             "base_url": "https://cloudcode-pa.googleapis.com/v1internal",
             "default_models": [
-            "gemini-2.5-pro",
-            "gemini-2.5-pro-maxthinking",
-            "gemini-2.5-pro-nothinking",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-maxthinking",
-            "gemini-2.5-flash-nothinking",
-            "gemini-3-pro-preview",
-            "gemini-3-pro-preview-maxthinking",
-            "gemini-3-pro-preview-nothinking"
-    ]
+                "gemini-2.5-pro",
+                "gemini-2.5-pro-maxthinking",
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-maxthinking",
+                "gemini-3-pro-preview",
+                "gemini-3-pro-preview-maxthinking",
+            ]
+        },
+        {
+            "name": "Antigravity",
+            "adapter_type": "antigravity",
+            "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com", 
+            "default_models": [
+                # --- Gemini 2.5 系列 ---
+                "gemini-2.5-pro",
+                "gemini-2.5-pro-maxthinking",
+                # "gemini-2.5-pro-nothinking", # 可选，通常 default 就够了
+                
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-maxthinking",
+                
+                # --- Gemini 3 系列 ---
+                "gemini-3-pro-preview",       # 对应 High
+                "gemini-3-pro-preview-maxthinking",
+                
+                "gemini-3-pro-low",           # [新增] 速度快
+                
+                "gemini-3-pro-image-preview", # [新增] 图像生成
+                
+                # --- Claude 系列 ---
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5-thinking",
+                "claude-opus-4-5-thinking",   # [新增] 强力思考模型
+                
+                # --- GPT 系列 ---
+                "gpt-oss-120b"                 # [新增] 对应 constants.py 里的映射
+            ]
         }
     ]
 
     for p_data in platforms:
         # 使用 update_or_create 防止重复运行脚本报错
+        # 注意：这里会更新已存在平台的 default_models，确保新模型能被加上
         await Platform.update_or_create(
             name=p_data["name"],
             defaults=p_data
         )
-    logger.info(f"✅ 已预创建 {len(platforms)} 个平台")
+    logger.info(f"✅ 已预创建/更新 {len(platforms)} 个平台")
 
     # 2. 创建一个管理员测试 Key
     admin_name = "Super Admin Key"

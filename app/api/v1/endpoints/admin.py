@@ -245,3 +245,17 @@ async def list_usage_logs(
         offset=offset, 
         limit=limit
     )
+@router.post("/channels/{channel_id}/sync_usage", response_model=DataResponse[Dict[str, Any]], operation_id="sync_channel_usage_quota")
+async def sync_channel_usage_quota(
+    channel_id: int = Path(..., title="Channel ID"),
+    service: AdminService = Depends(get_admin_service)
+):
+    """
+    手动同步渠道的使用进度 (Rate Limits)
+    
+    1. 调用 Adapter 获取上游剩余额度 (Remaining Quota)
+    2. 计算已用额度并强制校准 Redis 计数器
+    3. 将最新进度持久化回数据库
+    """
+    result = await service.sync_channel_usage(channel_id)
+    return DataResponse(data=result)

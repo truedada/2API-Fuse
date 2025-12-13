@@ -3,6 +3,7 @@ from app.repositories.channel import ChannelRepository
 from app.repositories.platform import PlatformRepository
 from app.services.admin import AdminService
 from app.services.google_auth import GoogleAuthService
+from app.services.antigravity_auth import AntigravityAuthService
 from app.repositories.apikey import ApiKeyRepository
 from app.repositories.usage_log import UsageLogRepository
 def get_channel_repo() -> ChannelRepository:
@@ -29,3 +30,11 @@ def get_google_auth_service(
     platform_repo: PlatformRepository = Depends(get_platform_repo),
 ) -> GoogleAuthService:
     return GoogleAuthService(channel_repo, platform_repo)
+
+
+# Dependency Helper
+def get_antigravity_service(
+    channel_repo: ChannelRepository = Depends(get_channel_repo),
+    platform_repo: PlatformRepository = Depends(get_platform_repo),
+) -> AntigravityAuthService:
+    return AntigravityAuthService(channel_repo, platform_repo)
