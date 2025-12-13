@@ -1,12 +1,16 @@
+# app/schemas/google_auth.py
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
-from app.core.config import settings
 
+class PlatformSimpleResponse(BaseModel):
+    id: int
+    name: str
+    adapter_type: str
+    
 # 生成授权链接请求
 class GoogleAuthURLRequest(BaseModel):
-    # 允许前端覆盖回调地址（可选），否则使用后端配置的默认值
+    # 删减授权时前端可选的指定跳转url的那个参数。直接服务器生成
     pass
-    #redirect_uri: Optional[str] = Field(settings.GOOGLE_REDIRECT_URI, description="可选：覆盖后端配置的默认回调地址")
 
 class GoogleAuthURLResponse(BaseModel):
     url: str

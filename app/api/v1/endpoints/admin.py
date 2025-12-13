@@ -7,7 +7,8 @@ from app.schemas.admin import (
     PlatformCreate, PlatformResponse, PlatformUpdate,
     ApiKeyCreate, ApiKeyResponse, ApiKeyUpdate,
     IDRequest,
-    UsageLogResponse
+    UsageLogResponse,
+    AdapterTypeResponse
 )
 from app.schemas.error import APIErrorResponse
 from app.services.admin import AdminService
@@ -44,6 +45,17 @@ async def get_current_admin_identity(
 # =========================================================
 # Platform 平台管理 (全部 POST/GET)
 # =========================================================
+# --- 新增：获取支持的适配器类型 ---
+@router.get("/adapters", response_model=ListResponse[AdapterTypeResponse], operation_id="list_adapter_types")
+async def list_adapter_types(
+    service: AdminService = Depends(get_admin_service)
+):
+    """
+    获取系统支持的所有适配器类型 (如 OpenAI, Antigravity, Zai 等)
+    用于前端创建平台时的下拉选项
+    """
+    items = await service.get_supported_adapter_types()
+    return ListResponse(items=items, total=len(items), offset=0, limit=len(items))
 
 @router.get("/platforms", response_model=ListResponse[PlatformResponse], operation_id="list_platforms")
 async def list_platforms(

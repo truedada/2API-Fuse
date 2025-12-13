@@ -18,6 +18,26 @@ from app.core.exceptions.definitions import (
 )
 from app.core.config import settings
 
+# --- 辅助函数：获取客户端 IP ---
+def get_client_ip(request: Request) -> str:
+    """
+    根据配置获取客户端真实 IP。
+    如果启用了 Cloudflare，优先从 CF-Connecting-IP 头获取。
+    """
+    # 检查配置是否启用 Cloudflare
+    use_cloudflare = settings.USE_CLOUDFLARE
+    
+    if use_cloudflare:
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            return cf_ip
+            
+    # 回退方案或默认方案：直接获取连接 IP
+    if request.client and request.client.host:
+        return request.client.host
+        
+    return "Unknown"
+
 # --- 统一响应格式 ---
 def create_error_response(
     status_code: int,
@@ -42,7 +62,8 @@ def create_error_response(
 
 async def api_exception_handler(request: Request, exc: BaseAPIException) -> JSONResponse:
     """处理自定义 BaseAPIException"""
-    logger.warning(f"业务异常 [{exc.status_code} {exc.error_code}]: {exc.detail} | Path: {request.url.path}")
+    client_ip = get_client_ip(request)
+    logger.warning(f"[IP: {client_ip}] 业务异常 [{exc.status_code} {exc.error_code}]: {exc.detail} | Path: {request.url.path}")
     return create_error_response(
         status_code=exc.status_code,
         code=exc.error_code,
@@ -53,7 +74,8 @@ async def api_exception_handler(request: Request, exc: BaseAPIException) -> JSON
 
 async def http_exception_handler(request: Request, exc: HTTPException | StarletteHTTPException) -> JSONResponse:
      """处理 FastAPI/Starlette 内置 HTTPException"""
-     # logger.info(f"HTTP 异常 [{exc.status_code}]: {exc.detail} | Path: {request.url.path}")
+     # client_ip = get_client_ip(request)
+     # logger.info(f"HTTP 异常 [IP: {client_ip}] [{exc.status_code}]: {exc.detail} | Path: {request.url.path}")
 
      # 根据HTTP状态码映射错误码
      error_code_map = {
@@ -117,7 +139,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
          details.append(f"{loc}: {error['msg']} ({error['type']})")
 
      detail_str = "; ".join(details)
-     logger.warning(f"请求参数验证失败: {detail_str} | Path: {request.url.path}")
+     client_ip = get_client_ip(request)
+     logger.warning(f"[IP: {client_ip}] 请求参数验证失败 : {detail_str} | Path: {request.url.path}")
 
      # 序列化错误信息，确保可以JSON序列化
      serialized_errors = _serialize_validation_errors(errors)
@@ -132,19 +155,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 async def tortoise_does_not_exist_handler(request: Request, exc: DoesNotExist) -> JSONResponse:
       """处理 Tortoise ORM 资源未找到异常"""
-      logger.info(f"数据库资源未找到: {exc} | Path: {request.url.path}")
+      client_ip = get_client_ip(request)
+      logger.info(f"[IP: {client_ip}] 数据库资源未找到 : {exc} | Path: {request.url.path}")
       # 转换为自定义的 404 异常
       return await api_exception_handler(request, NotFound(detail=str(exc)))
 
 async def tortoise_integrity_error_handler(request: Request, exc: IntegrityError) -> JSONResponse:
       """处理 Tortoise ORM 数据库完整性约束异常 (如唯一键冲突)"""
-      logger.warning(f"数据库完整性约束冲突: {exc} | Path: {request.url.path}")
+      client_ip = get_client_ip(request)
+      logger.warning(f"[IP: {client_ip}] 数据库完整性约束冲突 : {exc} | Path: {request.url.path}")
        # 转换为自定义的 409 异常
       return await api_exception_handler(request, ResourceConflict(detail=f"数据冲突或重复: {exc}"))
       
 async def tortoise_db_error_handler(request: Request, exc: OperationalError | DBConnectionError) -> JSONResponse:
       """处理 Tortoise ORM 数据库操作或连接异常"""
-      logger.error(f"数据库操作或连接错误: {exc} | Path: {request.url.path}")
+      client_ip = get_client_ip(request)
+      logger.error(f"[IP: {client_ip}] 数据库操作或连接错误 : {exc} | Path: {request.url.path}")
       # 转换为自定义的 500 异常
       return await api_exception_handler(request, DatabaseError(detail="数据库操作失败或连接不可用"))
 
@@ -154,7 +180,8 @@ async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse
     通常用于捕获业务逻辑中显式抛出的 raise ValueError("..."), 如 "未知的适配器"。
     将其转换为 InvalidInput (400) 异常响应。
     """
-    logger.warning(f"非法输入或参数错误: {exc} | Path: {request.url.path}")
+    client_ip = get_client_ip(request)
+    logger.warning(f"[IP: {client_ip}] 非法输入或参数错误 : {exc} | Path: {request.url.path}")
     # 转换为自定义的 InvalidInput 异常 (通常对应 HTTP 400)
     return await api_exception_handler(request, InvalidInput(detail=str(exc)))
 
@@ -163,7 +190,8 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
      捕获所有未处理的异常 (500 Internal Server Error)。
      记录详细日志，但在非调试模式下返回通用错误信息，避免泄露服务器内部细节。
      """
-     logger.exception(f"发生未处理的服务器内部错误: {exc.__class__.__name__} - {exc} | Path: {request.url.path}")
+     client_ip = get_client_ip(request)
+     logger.exception(f"[IP: {client_ip}] 发生未处理的服务器内部错误 : {exc.__class__.__name__} - {exc} | Path: {request.url.path}")
 
      detail = "服务器内部错误，请联系管理员"
      # 调试模式下，返回详细错误信息

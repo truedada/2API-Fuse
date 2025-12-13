@@ -1,7 +1,7 @@
 # app/services/admin.py
 import time
 from datetime import datetime, timezone  # 【修改】引入 timezone
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Dict
 from app.repositories.channel import ChannelRepository
 from app.repositories.platform import PlatformRepository
 from app.repositories.apikey import ApiKeyRepository
@@ -60,7 +60,11 @@ class AdminService:
     # ==========================
     # Platform (平台) 管理
     # ==========================
-    
+    # --- 新增：获取支持的适配器类型 ---
+    async def get_supported_adapter_types(self) -> List[Dict[str, str]]:
+        """获取系统支持的所有适配器类型"""
+        return AdapterFactory.get_supported_adapters()
+
     async def get_platforms(self) -> List[dict]:
         return await self.platform_repo.all(order_by=["id"])
 

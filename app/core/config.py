@@ -77,6 +77,7 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/userinfo.profile",
     ]
 
+    USE_CLOUDFLARE : bool = False
     # 【关键优化】自动计算数据库连接字符串
     @computed_field
     @property

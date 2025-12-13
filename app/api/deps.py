@@ -2,7 +2,7 @@ from fastapi import Depends
 from app.repositories.channel import ChannelRepository
 from app.repositories.platform import PlatformRepository
 from app.services.admin import AdminService
-from app.services.google_auth import GoogleAuthService
+from app.services.geminicli_auth import GeminiCliAuthService
 from app.services.antigravity_auth import AntigravityAuthService
 from app.repositories.apikey import ApiKeyRepository
 from app.repositories.usage_log import UsageLogRepository
@@ -25,11 +25,11 @@ def get_admin_service(
     return AdminService(channel_repo, platform_repo, apikey_repo, usage_log_repo)
 
 
-def get_google_auth_service(
+def get_geminicli_auth_service(
     channel_repo: ChannelRepository = Depends(get_channel_repo),
     platform_repo: PlatformRepository = Depends(get_platform_repo),
-) -> GoogleAuthService:
-    return GoogleAuthService(channel_repo, platform_repo)
+) -> GeminiCliAuthService:
+    return GeminiCliAuthService(channel_repo, platform_repo)
 
 
 # Dependency Helper

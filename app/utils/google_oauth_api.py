@@ -1,4 +1,4 @@
-from gc import enable
+# app/utils/google_oauth_api.py
 from loguru import logger
 import httpx
 from urllib.parse import urlencode
@@ -14,16 +14,23 @@ class GoogleOAuth2Helper:
     
     # 模拟 Gemini CLI 的 User-Agent，防止被风控
     USER_AGENT = "geminicli-oauth/1.0"
+    # Antigravity 专用 User-Agent
+    ANTIGRAVITY_USER_AGENT = "antigravity/1.11.9 windows/amd64"
 
     @staticmethod
-    def _get_client() -> httpx.AsyncClient:
+    def _get_client(headers: Optional[Dict] = None) -> httpx.AsyncClient:
         """获取配置了代理的 AsyncClient"""
         # 修复原代码中 ( "" or None ) 的逻辑瑕疵
         proxy = Proxy(settings.PROXY_URL) if settings.PROXY_URL else None
+        final_headers = {"User-Agent": GoogleOAuth2Helper.USER_AGENT}
+        if headers:
+            final_headers.update(headers)
+            
         return httpx.AsyncClient(
             proxy=proxy, 
             timeout=30.0,
-            headers={"User-Agent": GoogleOAuth2Helper.USER_AGENT}
+            verify=False, # 统一关闭 SSL 验证以适应某些代理环境
+            headers=final_headers
         )
 
     @staticmethod
@@ -144,3 +151,33 @@ class GoogleOAuth2Helper:
                 except Exception:
                     # 忽略启用失败，不阻断主流程
                     pass
+
+    @staticmethod
+    async def fetch_antigravity_project_id(access_token: str) -> Optional[str]:
+        """
+        调用 Internal API 获取真实的 Project ID (Antigravity 专用)
+        逻辑源自: v1internal:loadCodeAssist
+        """
+        url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": GoogleOAuth2Helper.ANTIGRAVITY_USER_AGENT,
+            "Content-Type": "application/json",
+            #"Host": "daily-cloudcode-pa.sandbox.googleapis.com"
+        }
+        data = {"metadata": {"ideType": "ANTIGRAVITY"}}
+
+        # 这里不复用 _get_client 因为 header 差异较大
+        # 修复原代码中 ( "" or None ) 的逻辑瑕疵
+        proxy = Proxy(settings.PROXY_URL) if settings.PROXY_URL else None
+        
+        async with httpx.AsyncClient(proxy=proxy, timeout=10.0, verify=False) as client:
+            resp = await client.post(url, json=data, headers=headers)
+            if resp.status_code == 200:
+                json_data = resp.json()
+                return json_data.get("cloudaicompanionProject")
+            else:
+                # raise ExternalServiceError(f"LoadCodeAssist failed: {resp.status_code} {resp.text}")
+                # 原逻辑只是 print error，这里也可以抛出或返回 None
+                logger.error(f"LoadCodeAssist failed: {resp.status_code} {resp.text}")
+                return None

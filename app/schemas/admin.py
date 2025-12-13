@@ -124,3 +124,7 @@ class UsageLogResponse(BaseSchema):
     platform_name: Optional[str] = Field(None, description="所属平台名称")
     
     created_at: datetime
+
+class AdapterTypeResponse(BaseSchema):
+    value: str
+    label: str

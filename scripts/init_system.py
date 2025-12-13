@@ -21,7 +21,7 @@ async def seed_data():
     # 1. 预置常用平台
     platforms = [
         {
-            "name": "Z2API",
+            "name": "ZAI",
             "adapter_type": "zai",
             "base_url": "https://chat.z.ai/api",
             "model_map": {
