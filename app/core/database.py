@@ -40,10 +40,7 @@ def get_tortoise_config() -> Dict[str, Any]:
                 # 如果连接池中的连接空闲时间超过该值，MySQL 会断开连接。
                 # 设置 pool_recycle 小于 wait_timeout (如 60秒 或 3600秒) 
                 # 可以强制回收旧连接，防止 "MySQL server has gone away" 错误。
-                'pool_recycle': 60,
-                'connect_timeout': 10, # 连接超时
-                'minsize': 1,          # 连接池最小连接数
-                'maxsize': 10,         # 连接池最大连接数 (可根据并发调整)
+                'pool_recycle': 60
             }
         }
     
