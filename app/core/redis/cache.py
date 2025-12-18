@@ -129,9 +129,21 @@ class CacheService:
         
         if channels:
             logger.info(f"平台 {platform_id} 配置变更，正在联动刷新 {len(channels)} 个 Channel 的缓存...")
-            # 使用 asyncio.gather 并发执行，避免循环 await 导致阻塞太久
-            sync_tasks = [CacheService.sync_channel(c.id) for c in channels]
+            
+            # 【修复】使用 Semaphore 限制并发数，防止 Redis 连接池耗尽 (Too many connections)
+            # 限制同时只有 10 个协程在执行 sync_channel，避免瞬间建立过多连接
+            sem = asyncio.Semaphore(10)
+
+            async def bounded_sync(c_id):
+                async with sem:
+                    try:
+                        await CacheService.sync_channel(c_id)
+                    except Exception as e:
+                        logger.error(f"联动刷新 Channel {c_id} 失败: {e}")
+
+            sync_tasks = [bounded_sync(c.id) for c in channels]
             await asyncio.gather(*sync_tasks)
+            
             logger.info(f"平台 {platform_id} 下的所有 Channel 缓存刷新完毕")
 
     @staticmethod
