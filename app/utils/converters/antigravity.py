@@ -13,7 +13,6 @@ class AntigravityConverter(GeminiConverter):
     Antigravity 专用转换器
     继承自 GeminiConverter，处理特殊的封包格式和 Claude/Thinking 兼容性
     """
-
     @staticmethod
     async def openai_to_antigravity_payload(request_data: Dict[str, Any], project_id: str) -> Dict[str, Any]:
         """
@@ -40,8 +39,26 @@ class AntigravityConverter(GeminiConverter):
 
         # 3.2 [特殊修正] System Instruction 格式修正
         # Antigravity 要求 systemInstruction 必须包含 role: "user"
+        # 并且必须前置固定的 Antigravity 系统提示词
+        #
+        # 策略：使用插入方式而非替换
+        # - 将 Antigravity 必需提示词作为 parts 数组的第一个元素
+        # - 保留用户原有的系统提示词作为后续元素
+
+        # 构建 parts 数组，Antigravity 必需提示词始终在最前面
+        system_parts = [{"text": constants.REQUIRED_SYSTEM_INSTRUCTION}]
+
+        # 如果用户提供了系统提示词，将其追加到后面
         if "systemInstruction" in gemini_request:
-            gemini_request["systemInstruction"]["role"] = "user"
+            existing_parts = gemini_request["systemInstruction"].get("parts", [])
+            # 保留用户的所有 parts（可能包含多个文本块）
+            system_parts.extend(existing_parts)
+
+        # 设置最终的 systemInstruction（role 必须为 user）
+        gemini_request["systemInstruction"] = {
+            "role": "user",
+            "parts": system_parts
+        }
 
         # 4. 处理 Thinking 和 Claude 的兼容性配置
         is_claude = "claude" in internal_model.lower()
@@ -52,17 +69,45 @@ class AntigravityConverter(GeminiConverter):
         if is_claude and "tools" in gemini_request:
             AntigravityConverter._deep_clean_claude_tools(gemini_request["tools"])
 
-        # 6. 构造 Antigravity 外层封装
-        # Session ID 生成逻辑，用于保持会话一致性
+        # 6. 构造 request 内层，确保字段顺序正确
+        # Antigravity 对字段顺序敏感：contents → generationConfig → sessionId → toolConfig → systemInstruction
         n = uuid.uuid4().int & (1 << 63) - 1
-        gemini_request["sessionId"] = f"-{n}"
+        session_id = f"-{n}"
 
+        # 按正确顺序重新构建 request 对象
+        request_payload = {}
+
+        # 1. contents (必须)
+        if "contents" in gemini_request:
+            request_payload["contents"] = gemini_request["contents"]
+
+        # 2. generationConfig (如果有)
+        if "generationConfig" in gemini_request:
+            request_payload["generationConfig"] = gemini_request["generationConfig"]
+
+        # 3. sessionId (关键位置)
+        request_payload["sessionId"] = session_id
+
+        # 4. toolConfig (如果有)
+        if "toolConfig" in gemini_request:
+            request_payload["toolConfig"] = gemini_request["toolConfig"]
+
+        # 5. systemInstruction (如果有)
+        if "systemInstruction" in gemini_request:
+            request_payload["systemInstruction"] = gemini_request["systemInstruction"]
+
+        # 6. tools (如果有)
+        if "tools" in gemini_request:
+            request_payload["tools"] = gemini_request["tools"]
+
+        # 7. 构造最终的外层封装
         final_payload = {
-            "model": internal_model,
-            "userAgent": constants.USER_AGENT,
             "project": project_id,
-            "requestId": f"agent-{uuid.uuid4()}",
-            "request": gemini_request
+            "request": request_payload,
+            "model": internal_model,
+            "userAgent": "antigravity",  # 注意：只用 "antigravity"，不是完整的 user agent
+            "requestType": "agent",       # 必须字段
+            "requestId": f"agent-{uuid.uuid4()}"
         }
 
         return final_payload

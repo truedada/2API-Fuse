@@ -3,6 +3,7 @@ from typing import Dict, Optional, Tuple, Any
 from app.core.config import settings
 from app.services.base_google_oauth import BaseGoogleOAuthService
 from app.utils.google_oauth_api import GoogleOAuth2Helper
+from app.core.exceptions.definitions import ExternalServiceError
 
 class GeminiCliAuthService(BaseGoogleOAuthService):
     
@@ -43,7 +44,7 @@ class GeminiCliAuthService(BaseGoogleOAuthService):
                 await GoogleOAuth2Helper.enable_required_services(access_token, final_project_id)
             except Exception:
                 pass
-        
+
         # 分支 B: 用户未提供，执行自动检测逻辑
         else:
             try:
@@ -56,17 +57,25 @@ class GeminiCliAuthService(BaseGoogleOAuthService):
                         if "default" in pid.lower() or "default" in pname.lower():
                             final_project_id = pid
                             break
-                    
+
                     if not final_project_id and len(projects) > 0:
                         final_project_id = projects[0].get("projectId")
-                    
+
                     # 如果找到了项目，尝试激活 Gemini 必要服务
                     if final_project_id:
                         await GoogleOAuth2Helper.enable_required_services(access_token, final_project_id)
-            except Exception:
-                # 获取项目或激活服务失败不强制阻断
-                pass
-        
+            except Exception as e:
+                # 获取项目失败，抛出异常
+                raise ExternalServiceError(
+                    detail=f"无法获取 Google Cloud 项目列表，请检查账号权限。错误: {str(e)}"
+                )
+
+        # 最终检查：如果 project_id 仍然为 None，说明没有可用项目
+        if not final_project_id:
+            raise ExternalServiceError(
+                detail="无法获取 Google Cloud Project ID。该账号可能没有可用的项目，请先在 Google Cloud Console 创建项目或提供 project_id 参数"
+            )
+
         return final_project_id
 
     def get_channel_config(self) -> Tuple[list, Dict]:

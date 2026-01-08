@@ -15,7 +15,11 @@ CLIENT_SECRET = "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"
 GOOGLE_OAUTH2_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 # User Agent
-USER_AGENT = "antigravity/1.11.9 windows/amd64"
+USER_AGENT = "antigravity/1.104.0 darwin/arm64"
+
+# Required System Instruction
+# 所有 Antigravity 请求必须前置的系统提示词
+REQUIRED_SYSTEM_INSTRUCTION = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.Absolute paths only****Proactiveness"
 
 # Ignore List
 # 这些是内部产生的无效模型ID或占位符，fetch_models 时应当过滤

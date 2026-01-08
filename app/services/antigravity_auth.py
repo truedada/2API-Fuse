@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional, Tuple
 from app.services.base_google_oauth import BaseGoogleOAuthService
 from app.utils.google_oauth_api import GoogleOAuth2Helper
 from app.core.config import settings
+from app.core.exceptions.definitions import ExternalServiceError
 
 class AntigravityAuthService(BaseGoogleOAuthService):
     # --- Antigravity Constants ---
@@ -37,8 +38,17 @@ class AntigravityAuthService(BaseGoogleOAuthService):
                 # 调用我们移入 GoogleOAuth2Helper 的新方法
                 final_project_id = await GoogleOAuth2Helper.fetch_antigravity_project_id(access_token)
             except Exception as e:
-                # 即使获取失败，也不阻断保存（可能用户只想先存下来手动改）
-                print(f"Antigravity Project ID fetch failed: {e}")
+                # 获取失败，抛出异常而不是继续
+                raise ExternalServiceError(
+                    detail=f"无法获取 Antigravity Project ID，请检查 Google Cloud 权限。错误: {str(e)}"
+                )
+
+        # 如果 final_project_id 仍然为 None，说明出现了问题
+        if not final_project_id:
+            raise ExternalServiceError(
+                detail="无法获取 Antigravity Project ID，该账号可能没有可用的 Google Cloud 项目或权限不足"
+            )
+
         return final_project_id
 
     def get_channel_config(self) -> Tuple[list, Dict]:

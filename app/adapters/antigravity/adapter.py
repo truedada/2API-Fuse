@@ -86,18 +86,22 @@ class AntigravityAdapter(BaseAdapter):
         proxy = httpx.Proxy(self.proxy_url) if self.proxy_url else None
         timeout = 60.0 if stream else 300.0
 
+        # 启用 HTTP/2 以匹配真实 Antigravity 客户端行为
+        http2 = True
+
         for idx, base_url in enumerate(base_urls):
             path = constants.PATH_STREAM if stream else constants.PATH_GENERATE
             url = f"{base_url}{path}" + ("?alt=sse" if stream else "")
             
             headers = {
-                "Content-Type": "application/json",
                 "User-Agent": constants.USER_AGENT,
-                "Authorization": f"Bearer {token}",
-                "Accept": "text/event-stream" if stream else "application/json"
+                "Accept": "text/event-stream" if stream else "application/json",
+                "Accept-Encoding": "gzip",
+                "Content-Type": "application/json",
+                "authorization": f"Bearer {token}"
             }
 
-            client = httpx.AsyncClient(proxy=proxy, timeout=timeout, verify=False)
+            client = httpx.AsyncClient(proxy=proxy, timeout=timeout, verify=False, http2=http2)
 
             try:
                 if stream:
@@ -134,6 +138,8 @@ class AntigravityAdapter(BaseAdapter):
                 if response.status_code == 401:
                     raise InvalidCredentials(f"无效的 Token: {err_text}")
                 elif response.status_code == 429:
+                    logger.info(f"Antigravity 请求头 {headers}")
+                    logger.info(f"Antigravity 请求体 {payload}")
                     raise ServiceUnavailable(f"触发限流 ({base_url}) {err_text}")
                 else:
                     # 这里会把 err_text 抛出来，你就能看到 400 的具体原因了
@@ -215,12 +221,14 @@ class AntigravityAdapter(BaseAdapter):
         for base_url in base_urls:
             url = f"{base_url}{constants.PATH_MODELS}"
             headers = {
-                "Authorization": f"Bearer {token}",
                 "User-Agent": constants.USER_AGENT,
-                "Content-Type": "application/json"
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "Content-Type": "application/json",
+                "authorization": f"Bearer {token}"
             }
             try:
-                async with httpx.AsyncClient(proxy=proxy, timeout=10.0, verify=False) as client:
+                async with httpx.AsyncClient(proxy=proxy, timeout=10.0, verify=False, http2=True) as client:
                     resp = await client.post(url, json={}, headers=headers)
                     
                     if resp.status_code == 200:
